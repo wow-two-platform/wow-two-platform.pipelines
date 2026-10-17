@@ -233,12 +233,12 @@ class VersionTests(unittest.TestCase):
         self.assertEqual({"channel": "release", "kind": "release", "version": "0.10.1", "release": "v0.10.1",
                           "tag": "0.10.1", "moving": "latest"}, identity)
 
-    def test_dev_replaces_its_build_under_a_moving_tag(self):
+    def test_a_dev_branch_builds_an_ordinary_candidate(self):
         git(self.repo, "checkout", "-q", "-b", "dev")
         self.write("engineering/codebase/pilot.backend-services/Pilot.Api/Program.cs", "two")
         second = self.commit("dev work")
         dev = release.build_identity(self.repo, second, "dev")
-        self.assertEqual(("dev", "candidate", "0.10.0-dev.1", "sha-" + second[:7], "dev-latest", "dev-latest"),
+        self.assertEqual(("branch", "candidate", "0.10.0-dev.1", "sha-" + second[:7], "sha-" + second[:7], None),
                          (dev["channel"], dev["kind"], dev["version"], dev["release"], dev["tag"], dev["moving"]))
 
     def test_a_test_branch_builds_an_ordinary_candidate(self):
@@ -281,9 +281,10 @@ class VersionTests(unittest.TestCase):
         planned = release.plan(descriptor, self.repo, self.first, None, None, "0.10.0-dev.3")
         self.assertEqual({"0.10.0-dev.3"}, {entry["version"] for entry in planned["services"].values()})
         images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
-        identity = {"version": "0.10.0-dev.3", "channel": "dev"}
-        _, manifest = release.render(descriptor, planned, images, "dev", identity=identity)
-        self.assertEqual(("0.10.0-dev.3", "dev", "dev"), (manifest["version"], manifest["channel"], manifest["branch"]))
+        identity = {"version": "0.10.0-dev.3", "channel": "branch"}
+        _, manifest = release.render(descriptor, planned, images, "feat/login", identity=identity)
+        self.assertEqual(("0.10.0-dev.3", "branch", "feat/login"),
+                         (manifest["version"], manifest["channel"], manifest["branch"]))
 
 
 class CiTests(unittest.TestCase):
@@ -343,11 +344,12 @@ class CiTests(unittest.TestCase):
         self.assertTrue(Path(self.temporary.name, "pilot-release.tar.gz").is_file())
         self.assertEqual("0.4.0", json.loads(Path(self.temporary.name, "bundle", "release.json").read_text())["version"])
 
-    def test_a_dev_build_moves_dev_latest_and_writes_no_archive(self):
+    def test_a_branch_build_tags_its_commit_and_writes_no_archive(self):
         result, outputs = self.run_ci("dev")
-        self.assertEqual(("built", "candidate", "dev", ""), (outputs["status"], outputs["kind"], outputs["channel"],
-                                                             outputs.get("archive", "")))
-        self.assertEqual({"dev-latest"}, {tag for _, tag, _ in self.built} | {tag for _, tag in self.moved})
+        self.assertEqual(("built", "candidate", "branch", ""), (outputs["status"], outputs["kind"], outputs["channel"],
+                                                                outputs.get("archive", "")))
+        self.assertEqual({"sha-" + self.commit[:7]}, {tag for _, tag, _ in self.built})
+        self.assertEqual(set(), {tag for _, tag in self.moved})
 
     def test_a_push_that_changes_nothing_is_skipped(self):
         base = {"product": "pilot", "release": "v0.4.0", "sourceCommit": self.commit,

@@ -31,7 +31,6 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 SHA = re.compile(r"[a-f0-9]{40}")
 LINE = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 # Branches whose builds replace their previous build under one moving image tag.
-CHANNELS = {"dev": "dev-latest"}
 REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._/:-]*[a-z0-9]")
 MEMORY = re.compile(r"[1-9][0-9]*[kmg]")
 DURATION = re.compile(r"[1-9][0-9]*[smh]")
@@ -282,9 +281,8 @@ def commits_ahead(repo, commit, main):
 def build_identity(repo, commit, branch=None, main="main"):
     """How a build of `commit` is published: channel, kind, version, bundle label, image tag and moving tag.
 
-    `main` releases `X.Y.Z`; `dev` publishes `X.Y.(Z+1)-dev.<n>` under `dev-latest`; any other branch, `test`
-    included, publishes the same pre-release shape as a candidate tagged `sha-<commit>`; a dispatched commit (no branch)
-    is a candidate `X.Y.(Z+1)-g<commit>`."""
+    `main` releases `X.Y.Z`; any other branch publishes a pre-release `X.Y.(Z+1)-<branch>.<n>` as a candidate tagged
+    `sha-<commit>`, with no moving tag; a dispatched commit (no branch) is a candidate `X.Y.(Z+1)-g<commit>`."""
     check(SHA.fullmatch(commit), "Resolve the commit to its full SHA first")
     check(not branch or BRANCH_NAME.fullmatch(branch), "Invalid branch")
     x, y = version_line(repo, commit)
@@ -296,9 +294,8 @@ def build_identity(repo, commit, branch=None, main="main"):
                 "tag": version, "moving": "latest"}
     if branch:
         version = "{}.{}.{}-{}.{}".format(x, y, z, tag_safe(branch), commits_ahead(repo, commit, main))
-        return {"channel": branch if branch in CHANNELS else "branch", "kind": "candidate", "version": version,
-                "release": "sha-" + short, "tag": CHANNELS.get(branch, "sha-" + short),
-                "moving": CHANNELS.get(branch)}
+        return {"channel": "branch", "kind": "candidate", "version": version, "release": "sha-" + short,
+                "tag": "sha-" + short, "moving": None}
     return {"channel": "branch", "kind": "candidate", "version": "{}.{}.{}-g{}".format(x, y, z, short),
             "release": "sha-" + short, "tag": "sha-" + short, "moving": None}
 

@@ -1,7 +1,6 @@
 # The shared build-and-publish workflow every product calls from its .github/workflows/publish-docker-image.yml.
 # It reads the product's engineering/deployment/deploy.yml, versions the build and publishes it:
 #   main          → release vX.Y.Z: changed images tagged X.Y.Z, every image tagged latest, bundle on a GitHub release
-#   dev           → X.Y.(Z+1)-dev.<n>: images under dev-latest, bundle-<commit> artifact
 #   other branch  → candidate X.Y.(Z+1)-<branch>.<n>: images tagged sha-<commit>, bundle-<commit> artifact
 #   commit input  → candidate X.Y.(Z+1)-g<commit> for a commit that has no build (Wheelhouse's Build action)
 # Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md § Builds and versions.

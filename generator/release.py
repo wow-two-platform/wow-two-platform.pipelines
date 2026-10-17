@@ -2,8 +2,8 @@
 """Builds a product's changed services from its deploy.yml and writes a Wheelhouse release bundle.
 
 A product version is X.Y.Z: X.Y is the newest engineering/planning/version-track/v{X.Y}/ folder, and Z the next patch
-after the highest vX.Y.* tag. A build of `main` is a release vX.Y.Z; a build of `dev` or `test` replaces that branch's
-previous build; any other branch, or a dispatched commit, builds a candidate. Only services whose paths changed since
+after the highest vX.Y.* tag. A build of `main` is a release vX.Y.Z; a build of `dev` replaces that branch's previous
+build; any other branch, or a dispatched commit, builds a candidate. Only services whose paths changed since
 the base release rebuild; the rest keep the base release's image and version, so each service carries the version in
 which it last changed. Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md.
 Requires Python 3.9+, Git and, for `build` / `ci`, Docker with Buildx; the descriptor parser needs PyYAML.
@@ -31,7 +31,7 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 SHA = re.compile(r"[a-f0-9]{40}")
 LINE = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 # Branches whose builds replace their previous build under one moving image tag.
-CHANNELS = {"dev": "dev-latest", "test": "test-latest"}
+CHANNELS = {"dev": "dev-latest"}
 REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._/:-]*[a-z0-9]")
 MEMORY = re.compile(r"[1-9][0-9]*[kmg]")
 DURATION = re.compile(r"[1-9][0-9]*[smh]")
@@ -282,9 +282,9 @@ def commits_ahead(repo, commit, main):
 def build_identity(repo, commit, branch=None, main="main"):
     """How a build of `commit` is published: channel, kind, version, bundle label, image tag and moving tag.
 
-    `main` releases `X.Y.Z`; `dev` and `test` publish `X.Y.(Z+1)-<branch>.<n>` under `dev-latest` / `test-latest`;
-    any other branch publishes the same pre-release shape as a candidate tagged `sha-<commit>`; a dispatched commit
-    (no branch) is a candidate `X.Y.(Z+1)-g<commit>`."""
+    `main` releases `X.Y.Z`; `dev` publishes `X.Y.(Z+1)-dev.<n>` under `dev-latest`; any other branch, `test`
+    included, publishes the same pre-release shape as a candidate tagged `sha-<commit>`; a dispatched commit (no branch)
+    is a candidate `X.Y.(Z+1)-g<commit>`."""
     check(SHA.fullmatch(commit), "Resolve the commit to its full SHA first")
     check(not branch or BRANCH_NAME.fullmatch(branch), "Invalid branch")
     x, y = version_line(repo, commit)

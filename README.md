@@ -43,7 +43,7 @@ jobs:
 | Built from | Version | Image tags | Bundle |
 |---|---|---|---|
 | `main` | `X.Y.Z` | `X.Y.Z`, `latest` | GitHub release `vX.Y.Z` asset `<product>-release.tar.gz` |
-| `dev` / `test` | `X.Y.(Z+1)-dev.<n>` / `-test.<n>` | `dev-latest` / `test-latest` | Actions artifact `bundle-<commit>` |
+| `dev` | `X.Y.(Z+1)-dev.<n>` | `dev-latest` | Actions artifact `bundle-<commit>` |
 | any other branch | `X.Y.(Z+1)-<branch>.<n>` | `sha-<commit>` | Actions artifact `bundle-<commit>` |
 | a dispatched commit | `X.Y.(Z+1)-g<commit>` | `sha-<commit>` | Actions artifact `bundle-<commit>` |
 

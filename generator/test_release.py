@@ -233,15 +233,21 @@ class VersionTests(unittest.TestCase):
         self.assertEqual({"channel": "release", "kind": "release", "version": "0.10.1", "release": "v0.10.1",
                           "tag": "0.10.1", "moving": "latest"}, identity)
 
-    def test_dev_and_test_replace_their_build_under_a_moving_tag(self):
+    def test_dev_replaces_its_build_under_a_moving_tag(self):
         git(self.repo, "checkout", "-q", "-b", "dev")
         self.write("engineering/codebase/pilot.backend-services/Pilot.Api/Program.cs", "two")
         second = self.commit("dev work")
         dev = release.build_identity(self.repo, second, "dev")
         self.assertEqual(("dev", "candidate", "0.10.0-dev.1", "sha-" + second[:7], "dev-latest", "dev-latest"),
                          (dev["channel"], dev["kind"], dev["version"], dev["release"], dev["tag"], dev["moving"]))
+
+    def test_a_test_branch_builds_an_ordinary_candidate(self):
+        git(self.repo, "checkout", "-q", "-b", "test")
+        self.write("engineering/codebase/pilot.backend-services/Pilot.Api/Program.cs", "two")
+        second = self.commit("test work")
         test = release.build_identity(self.repo, second, "test")
-        self.assertEqual(("test", "test-latest"), (test["channel"], test["tag"]))
+        self.assertEqual(("branch", "candidate", "0.10.0-test.1", "sha-" + second[:7], "sha-" + second[:7], None),
+                         (test["channel"], test["kind"], test["version"], test["release"], test["tag"], test["moving"]))
 
     def test_any_other_branch_builds_a_candidate_named_after_it(self):
         git(self.repo, "checkout", "-q", "-b", "feat/Login")

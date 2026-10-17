@@ -393,7 +393,7 @@ def push_local(reference, repository, tag):
     return next(item for item in digests if item.startswith(repository + "@"))
 
 
-def build_image(descriptor, name, checkout, repository, tag, app_version=None):
+def build_image(descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None):
     service = descriptor["services"][name]["build"]
     engineering = Path(checkout) / "engineering"
     with tempfile.TemporaryDirectory() as directory:
@@ -407,6 +407,9 @@ def build_image(descriptor, name, checkout, repository, tag, app_version=None):
         if app_version:
             # The build stamps its own version into the backend (-p:Version) and the SPA (__APP_VERSION__).
             arguments += ["--build-arg", "APP_VERSION=" + app_version]
+        if vcs_ref:
+            # The full commit SHA the image is built from, so the image can report its source commit.
+            arguments += ["--build-arg", "VCS_REF=" + vcs_ref]
         for key, path in sorted(service["contexts"].items()):
             arguments += ["--build-context", key + "=" + str(engineering / path)]
         docker(*arguments, str(engineering / service["context"]))
@@ -436,7 +439,8 @@ def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=
             if checkout is None and worktree is None:
                 worktree = tempfile.mkdtemp(prefix="wheelhouse-build-")
                 git(repo, "worktree", "add", "--detach", worktree, planned["sourceCommit"])
-            images[name] = build_image(descriptor, name, checkout or worktree, repository, tag, app_version)
+            images[name] = build_image(descriptor, name, checkout or worktree, repository, tag, app_version,
+                                       planned["sourceCommit"])
     finally:
         if worktree:
             subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", worktree], capture_output=True)

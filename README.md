@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   publish:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.1.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.3.0
     with:
       commit: ${{ inputs.commit }}
 ```
@@ -49,6 +49,9 @@ jobs:
 - `X.Y` is the newest `engineering/planning/version-track/v{X.Y}/` folder; `Z` follows the highest `vX.Y.*` tag.
 - A push that changes no service and not the descriptor publishes nothing.
 - Each image build receives `--build-arg APP_VERSION=<version>`; Dockerfiles pass it to `-p:Version` and the SPA.
+- Each image build also receives `--build-arg VCS_REF=<full commit SHA>`, the commit it was built from.
+- The checkout fetches the Git LFS files under `engineering/`, the only folder build contexts can reach, so images
+  carry real assets instead of pointer files; a repository without LFS fetches nothing.
 - Products pin a tag of this repository; a change here ships as a new tag, never by moving one.
 
 ## Running the generator locally

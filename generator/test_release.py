@@ -324,8 +324,8 @@ class CiTests(unittest.TestCase):
             stub.stop()
         self.temporary.cleanup()
 
-    def fake_build(self, descriptor, name, checkout, repository, tag, app_version=None):
-        self.built.append((name, tag, app_version))
+    def fake_build(self, descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None):
+        self.built.append((name, tag, app_version, vcs_ref))
         return repository + "@sha256:" + hashlib.sha256((name + tag).encode()).hexdigest()
 
     def run_ci(self, branch, base=None):
@@ -339,7 +339,8 @@ class CiTests(unittest.TestCase):
         result, outputs = self.run_ci("main")
         self.assertEqual({"status": "built", "kind": "release", "channel": "release", "version": "0.4.0",
                           "release": "v0.4.0", "archive": "pilot-release.tar.gz"}, outputs)
-        self.assertEqual({("api", "0.4.0", "0.4.0"), ("edge", "0.4.0", "0.4.0")}, set(self.built))
+        self.assertEqual({("api", "0.4.0", "0.4.0", self.commit), ("edge", "0.4.0", "0.4.0", self.commit)},
+                         set(self.built))
         self.assertEqual({"latest"}, {tag for _, tag in self.moved})
         self.assertTrue(Path(self.temporary.name, "pilot-release.tar.gz").is_file())
         self.assertEqual("0.4.0", json.loads(Path(self.temporary.name, "bundle", "release.json").read_text())["version"])
@@ -348,7 +349,7 @@ class CiTests(unittest.TestCase):
         result, outputs = self.run_ci("dev")
         self.assertEqual(("built", "candidate", "branch", ""), (outputs["status"], outputs["kind"], outputs["channel"],
                                                                 outputs.get("archive", "")))
-        self.assertEqual({"sha-" + self.commit[:7]}, {tag for _, tag, _ in self.built})
+        self.assertEqual({"sha-" + self.commit[:7]}, {tag for _, tag, _, _ in self.built})
         self.assertEqual(set(), {tag for _, tag in self.moved})
 
     def test_a_push_that_changes_nothing_is_skipped(self):
@@ -357,6 +358,28 @@ class CiTests(unittest.TestCase):
         result, outputs = self.run_ci("main", base)
         self.assertEqual("skipped", outputs["status"])
         self.assertEqual([], self.built)
+
+
+class BuildImageTests(unittest.TestCase):
+    """The docker buildx call for one service, with Docker stubbed."""
+
+    def test_a_build_receives_its_version_and_source_commit(self):
+        calls = []
+
+        def fake_docker(*arguments):
+            calls.append(arguments)
+            metadata = arguments[arguments.index("--metadata-file") + 1]
+            Path(metadata).write_text(json.dumps({"containerimage.digest": DIGEST[1:]}))
+            return ""
+
+        descriptor = release.validate(copy.deepcopy(DESCRIPTOR))
+        commit = "c" * 40
+        with unittest.mock.patch.object(release, "docker", fake_docker):
+            image = release.build_image(descriptor, "api", "/checkout", "ghcr.io/o/pilot/api", "0.4.0", "0.4.0", commit)
+        self.assertEqual("ghcr.io/o/pilot/api" + DIGEST, image)
+        arguments = list(calls[0])
+        build_args = [arguments[index + 1] for index, item in enumerate(arguments) if item == "--build-arg"]
+        self.assertEqual(["SERVICE=Api", "APP_VERSION=0.4.0", "VCS_REF=" + commit], build_args)
 
 
 if __name__ == "__main__":

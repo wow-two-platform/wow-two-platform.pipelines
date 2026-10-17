@@ -41,6 +41,13 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
           fetch-depth: 0
+      - name: Fetch the Git LFS files under engineering/
+        # Build contexts never leave engineering/, so its LFS files are all an image can contain; without this step
+        # images would carry LFS pointer files. A repository without LFS fetches nothing.
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull --include='engineering/**'
       - name: Check out the release generator at this workflow's own commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

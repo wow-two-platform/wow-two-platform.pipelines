@@ -447,6 +447,35 @@ def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=
     return images
 
 
+# ----------------------------------------------------------------------- notes
+
+NOTES_LIMIT = 100
+
+
+def release_notes(repo, commit, previous=None):
+    """The changelog a main release carries above GitHub's generated notes (pull requests and the compare link): the
+    commits since the previous release, newest first and one line each, 100 at most; merge commits are left out. A
+    first release lists its history up to the limit. Wheelhouse shows these bodies before a promotion."""
+    revisions = previous + ".." + commit if previous else commit
+    if previous:
+        check(subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", previous + "^{commit}"],
+                             capture_output=True).returncode == 0, "--previous names no commit: " + previous)
+    lines = [line for line in git(repo, "log", "--no-merges", "--format=%h%x09%s", "--max-count=" + str(NOTES_LIMIT),
+                                  revisions).splitlines() if line]
+    total = int(git(repo, "rev-list", "--count", "--no-merges", revisions).strip() or 0)
+    notes = ["Built by wow-two-platform.pipelines from " + commit + ".", ""]
+    notes.append("## Commits since " + previous if previous else "## Commits")
+    notes.append("")
+    for line in lines:
+        short, _, subject = line.partition("\t")
+        notes.append("- " + subject.strip() + " (" + short + ")")
+    if not lines:
+        notes.append("- No commits since " + previous + "." if previous else "- No commits.")
+    if total > len(lines):
+        notes.append("- …and " + str(total - len(lines)) + " more")
+    return "\n".join(notes) + "\n"
+
+
 # ------------------------------------------------------------------------- cli
 
 def load(repo, commit, descriptor_path=None):
@@ -456,7 +485,7 @@ def load(repo, commit, descriptor_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=["validate", "plan", "build", "ci"])
+    parser.add_argument("action", choices=["validate", "plan", "build", "ci", "notes"])
     parser.add_argument("--repo", default=".", help="the product repository")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--descriptor", help="a deploy.yml on disk instead of the one at the commit")
@@ -472,6 +501,7 @@ def main():
     parser.add_argument("--rollback-compatible", action="store_true")
     parser.add_argument("--output", help="bundle folder to write")
     parser.add_argument("--archive", help="also write a .tar.gz of the bundle for import")
+    parser.add_argument("--previous", help="notes: the previous release's tag; the notes list the commits since it")
     args = parser.parse_args()
     try:
         if args.action == "validate":
@@ -479,6 +509,9 @@ def main():
             print(json.dumps({"product": descriptor["product"], "services": sorted(descriptor["services"])}))
             return 0
         commit = git(args.repo, "rev-parse", "--verify", args.commit + "^{commit}").strip()
+        if args.action == "notes":
+            sys.stdout.write(release_notes(args.repo, commit, args.previous or None))
+            return 0
         descriptor = load(args.repo, commit, args.descriptor)
         if args.platform:
             descriptor["platform"] = args.platform

@@ -287,6 +287,70 @@ class VersionTests(unittest.TestCase):
                          (manifest["version"], manifest["channel"], manifest["branch"]))
 
 
+class NotesTests(unittest.TestCase):
+    """The commits a main release's notes list above GitHub's generated notes."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary.name)
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "config", "user.name", "Test")
+        git(self.repo, "config", "commit.gpgsign", "false")
+        git(self.repo, "config", "tag.gpgsign", "false")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def commit(self, message):
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def test_notes_list_the_commits_since_the_previous_release_newest_first(self):
+        self.commit("feat: first page")
+        git(self.repo, "tag", "v0.1.0")
+        self.commit("fix: kept the login\n\nA longer body that stays out of the notes.")
+        head = self.commit("feat: added billing")
+        short = git(self.repo, "rev-parse", "--short", "HEAD")
+        notes = release.release_notes(self.repo, head, "v0.1.0").splitlines()
+        self.assertEqual("Built by wow-two-platform.pipelines from " + head + ".", notes[0])
+        self.assertEqual("## Commits since v0.1.0", notes[2])
+        self.assertEqual(["- feat: added billing (" + short + ")", "- fix: kept the login"],
+                         [notes[4], notes[5].rsplit(" (", 1)[0]])
+        self.assertEqual(6, len(notes))
+
+    def test_a_first_release_lists_its_history_and_a_long_one_is_cut_at_the_limit(self):
+        for number in range(5):
+            head = self.commit("feat: step " + str(number))
+        with unittest.mock.patch.object(release, "NOTES_LIMIT", 3):
+            notes = release.release_notes(self.repo, head).splitlines()
+        self.assertEqual("## Commits", notes[2])
+        self.assertEqual(["- feat: step 4", "- feat: step 3", "- feat: step 2"],
+                         [line.rsplit(" (", 1)[0] for line in notes[4:7]])
+        self.assertEqual("- …and 2 more", notes[7])
+
+    def test_no_commit_since_the_previous_release_says_so_and_an_unknown_tag_is_refused(self):
+        head = self.commit("feat: only")
+        git(self.repo, "tag", "v0.1.0")
+        self.assertIn("- No commits since v0.1.0.", release.release_notes(self.repo, head, "v0.1.0"))
+        with self.assertRaisesRegex(release.Invalid, "--previous names no commit"):
+            release.release_notes(self.repo, head, "v9.9.9")
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML reads the workflow")
+    def test_the_publish_workflow_writes_the_notes_and_github_generated_notes_on_a_main_release(self):
+        import yaml
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / ".github/workflows/publish.yml").read_text())
+        steps = workflow["jobs"]["bundle"]["steps"]
+        fetch = next(step for step in steps if step.get("name", "").startswith("Fetch the previous release"))
+        self.assertIn('echo "PREVIOUS_RELEASE=$previous" >> "$GITHUB_ENV"', fetch["run"])
+        publish = next(step for step in steps if step.get("name", "").startswith("Publish the release"))
+        self.assertIn("steps.build.outputs.kind == 'release'", publish["if"])
+        for part in ("release.py \"${notes[@]}\"", "--previous \"$PREVIOUS_RELEASE\"", "--notes-file",
+                     "--generate-notes", "--notes-start-tag \"$PREVIOUS_RELEASE\""):
+            self.assertIn(part, publish["run"])
+        self.assertNotIn("--notes \"", publish["run"])
+
+
 class CiTests(unittest.TestCase):
     """The workflow's `ci` step with Docker stubbed: what it publishes and what it reports."""
 

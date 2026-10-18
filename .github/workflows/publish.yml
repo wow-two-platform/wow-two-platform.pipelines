@@ -1,6 +1,7 @@
 # The shared build-and-publish workflow every product calls from its .github/workflows/publish-docker-image.yml.
 # It reads the product's engineering/deployment/deploy.yml, versions the build and publishes it:
 #   main          → release vX.Y.Z: changed images tagged X.Y.Z, every image tagged latest, bundle on a GitHub release
+#                   whose notes list the commits since the previous release above GitHub's generated notes
 #   other branch  → candidate X.Y.(Z+1)-<branch>.<n>: images tagged sha-<commit>, bundle-<commit> artifact
 #   commit input  → candidate X.Y.(Z+1)-g<commit> for a commit that has no build (Wheelhouse's Build action)
 # Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md § Builds and versions.
@@ -70,6 +71,8 @@ jobs:
           product=$(python3 .pipelines/generator/release.py validate --repo . | python3 -c 'import json,sys; print(json.load(sys.stdin)["product"])')
           echo "PRODUCT=$product" >> "$GITHUB_ENV"
           previous=$(gh release list --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName // empty')
+          # The release notes list the commits since this release, and GitHub's generated notes start from it.
+          echo "PREVIOUS_RELEASE=$previous" >> "$GITHUB_ENV"
           if [ -n "$previous" ] && gh release download "$previous" -p "$product-release.tar.gz" -D base-archive; then
             mkdir -p base
             tar -xzf "base-archive/$product-release.tar.gz" -C base
@@ -83,12 +86,22 @@ jobs:
                      --registry "ghcr.io/${GITHUB_REPOSITORY,,}" --output bundle)
           [ -n "$BRANCH" ] && arguments+=(--branch "$BRANCH")
           python3 .pipelines/generator/release.py "${arguments[@]}" ${BASE_ARGUMENTS:-}
-      - name: Publish the release
+      - name: Publish the release with its notes
+        # The body: the commits since the previous release (release.py notes), then GitHub's generated notes — the
+        # pull requests merged since it and the compare link. Wheelhouse shows these bodies before a promotion.
         if: steps.build.outputs.status == 'built' && steps.build.outputs.kind == 'release'
         run: |
+          set -euo pipefail
+          notes=(notes --repo . --commit "$COMMIT")
+          start=()
+          if [ -n "${PREVIOUS_RELEASE:-}" ]; then
+            notes+=(--previous "$PREVIOUS_RELEASE")
+            start=(--notes-start-tag "$PREVIOUS_RELEASE")
+          fi
+          python3 .pipelines/generator/release.py "${notes[@]}" > "$RUNNER_TEMP/release-notes.md"
           gh release create "${{ steps.build.outputs.release }}" "${{ steps.build.outputs.archive }}" \
             --target "$COMMIT" --title "${{ steps.build.outputs.release }}" \
-            --notes "Built by wow-two-platform.pipelines from $COMMIT."
+            --notes-file "$RUNNER_TEMP/release-notes.md" --generate-notes "${start[@]}"
       - name: Upload the build's bundle
         if: steps.build.outputs.status == 'built' && steps.build.outputs.kind != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

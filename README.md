@@ -52,11 +52,15 @@ jobs:
 - Each image build also receives `--build-arg VCS_REF=<full commit SHA>`, the commit it was built from.
 - The checkout fetches the Git LFS files under `engineering/`, the only folder build contexts can reach, so images
   carry real assets instead of pointer files; a repository without LFS fetches nothing.
+- A `main` release's notes list the commits since the previous release (`release.py notes`, 100 at most, merges left
+  out), then GitHub's generated notes from that release on (merged pull requests and the compare link). Wheelhouse
+  shows them before a promotion.
 - Products pin a tag of this repository; a change here ships as a new tag, never by moving one.
 
 ## Running the generator locally
 
 ```bash
 python3 generator/release.py plan --repo <product> --commit HEAD
+python3 generator/release.py notes --repo <product> --commit HEAD --previous v0.4.2
 python3 -B -m unittest -v test_release        # from generator/
 ```

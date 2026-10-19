@@ -1,0 +1,88 @@
+# A product's whole push delivery, called from its .github/workflows/publish-docker-image.yml:
+#   current → plan → ci → publish
+# ci's plan job first skips a main push that a newer push already replaced, then reads what changed since the last
+# delivered commit: a docs-only push builds, tests and publishes nothing. Code changes run the selected checks, and
+# publish (publish.yml) versions, builds and releases the changed services once they pass. A pull request runs ci only.
+# A product that deploys itself adds its own deploy-dev job after this one, gated on the `published` output.
+# Inputs: ci.yml and README.md § Shared CI.
+name: delivery
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: A full commit SHA to build instead of the pushed commit (Wheelhouse's Build action)
+        type: string
+        required: false
+        default: ''
+      main-branch:
+        description: The branch whose builds are releases
+        type: string
+        required: false
+        default: main
+      docs:
+        description: JSON list of globs, beyond the defaults, that never build, test or publish
+        type: string
+        required: false
+        default: '[]'
+      backends:
+        description: JSON list of backend checks
+        type: string
+        required: false
+        default: '[]'
+      frontends:
+        description: JSON list of frontend checks
+        type: string
+        required: false
+        default: '[]'
+      browser:
+        description: JSON object of the sharded browser check, or empty
+        type: string
+        required: false
+        default: ''
+      pnpm-version:
+        description: The pnpm every Node job installs
+        type: string
+        required: false
+        default: 10.33.2
+    outputs:
+      changed:
+        description: "'true' when code changed since the last delivered commit"
+        value: ${{ jobs.ci.outputs.changed }}
+      published:
+        description: "'true' when publish ran and succeeded, whether or not a service changed"
+        value: ${{ jobs.publish.result == 'success' }}
+      release:
+        description: The release or candidate the run built, when it built one
+        value: ${{ jobs.publish.outputs.release }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      commit: ${{ inputs.commit }}
+      supersede: true
+      main-branch: ${{ inputs.main-branch }}
+      docs: ${{ inputs.docs }}
+      backends: ${{ inputs.backends }}
+      frontends: ${{ inputs.frontends }}
+      browser: ${{ inputs.browser }}
+      pnpm-version: ${{ inputs.pnpm-version }}
+
+  publish:
+    needs: ci
+    if: needs.ci.outputs.changed == 'true' && github.event_name != 'pull_request'
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+    with:
+      commit: ${{ inputs.commit }}
+      main-branch: ${{ inputs.main-branch }}

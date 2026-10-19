@@ -1,0 +1,297 @@
+# The shared CI every product runs, through delivery.yml on a push or directly: plan, backend, frontend, browser, gate.
+#   plan     reads what changed since the last delivered commit (generator/ci_plan.py) and picks the checks: a docs-only
+#            change runs none, a check with `paths` runs when they change, a path no check owns runs every check
+#   backend  .NET, Python or shell checks, one job each; NuGet and pnpm caches
+#   frontend pnpm workspaces: frozen install, then the listed package.json scripts; pnpm cache
+#   browser  one job per shard, with $SHARD and $SHARDS; evidence uploaded on failure
+#   gate     the one result to wait on: it passes when every selected check passed, also on a docs-only change, and is
+#            skipped only for a superseded push, so such a run never marks its commit delivered
+# Inputs are JSON; their keys and defaults: README.md § Shared CI.
+name: ci
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: A full commit SHA to verify instead of the pushed commit; it verifies everything
+        type: string
+        required: false
+        default: ''
+      supersede:
+        description: Skip a main push that a newer push has already replaced (delivery sets it)
+        type: boolean
+        required: false
+        default: false
+      main-branch:
+        description: The branch whose builds are releases
+        type: string
+        required: false
+        default: main
+      docs:
+        description: JSON list of globs, beyond the defaults, that never build, test or publish
+        type: string
+        required: false
+        default: '[]'
+      backends:
+        description: JSON list of backend checks
+        type: string
+        required: false
+        default: '[]'
+      frontends:
+        description: JSON list of frontend checks
+        type: string
+        required: false
+        default: '[]'
+      browser:
+        description: JSON object of the sharded browser check, or empty
+        type: string
+        required: false
+        default: ''
+      pnpm-version:
+        description: The pnpm every Node job installs
+        type: string
+        required: false
+        default: 10.33.2
+    outputs:
+      changed:
+        description: "'true' when code changed, so the commit has something to verify and publish"
+        value: ${{ jobs.plan.outputs.changed }}
+      superseded:
+        description: "'true' when a newer main push replaced this one"
+        value: ${{ jobs.plan.outputs.superseded }}
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      superseded: ${{ steps.plan.outputs.superseded }}
+      changed: ${{ steps.plan.outputs.changed }}
+      backends: ${{ steps.plan.outputs.backends }}
+      frontends: ${{ steps.plan.outputs.frontends }}
+      browsers: ${{ steps.plan.outputs.browsers }}
+    steps:
+      - name: Check out the CI planner at this workflow's own commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .pipelines
+          sparse-checkout: generator
+          persist-credentials: false
+      - name: Plan the checks this commit needs
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_COMMIT: ${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}
+          PLAN_DISPATCHED: ${{ inputs.commit != '' }}
+          PLAN_SUPERSEDE: ${{ inputs.supersede }}
+          PLAN_MAIN: ${{ inputs.main-branch }}
+          PLAN_PULL_BASE: ${{ github.event.pull_request.base.sha }}
+          PLAN_DOCS: ${{ inputs.docs }}
+          PLAN_BACKENDS: ${{ inputs.backends }}
+          PLAN_FRONTENDS: ${{ inputs.frontends }}
+          PLAN_BROWSER: ${{ inputs.browser }}
+        run: python3 .pipelines/generator/ci_plan.py
+
+  backend:
+    needs: plan
+    if: needs.plan.outputs.backends != '[]'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.backends) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: ${{ matrix.fetch-depth }}
+          lfs: ${{ matrix.lfs }}
+          persist-credentials: false
+      - name: Check out the release generator at this workflow's own commit
+        if: matrix.pipelines
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .pipelines
+          persist-credentials: false
+      - name: Point PIPELINES_DIR at it
+        if: matrix.pipelines
+        working-directory: .
+        run: echo "PIPELINES_DIR=$GITHUB_WORKSPACE/.pipelines" >> "$GITHUB_ENV"
+      - name: Set up .NET
+        if: matrix.dotnet
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: ${{ matrix.dotnet-json }}
+          dotnet-version: ${{ matrix.dotnet-version }}
+      - name: Restore the NuGet cache
+        if: matrix.dotnet
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ matrix.slug }}-${{ hashFiles('**/packages.lock.json', '**/*.csproj', '**/Directory.Packages.props', '**/Directory.Build.props', '**/global.json') }}
+          restore-keys: nuget-${{ runner.os }}-${{ matrix.slug }}-
+      - name: Set up pnpm
+        if: matrix.node != ''
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - name: Set up Node with the pnpm cache
+        if: matrix.node != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: ${{ matrix.pnpm-lock }}
+      - name: Set up Python
+        if: matrix.python != ''
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: ${{ matrix.pip-cache != '' && 'pip' || '' }}
+          cache-dependency-path: ${{ matrix.pip-cache }}
+      - name: Install Python packages
+        if: matrix.pip != ''
+        env:
+          PIP_ARGUMENTS: ${{ matrix.pip }}
+        # Word splitting is intended: the value is pip arguments, such as `-r requirements-test.txt`.
+        run: |
+          # shellcheck disable=SC2086
+          python -m pip install $PIP_ARGUMENTS
+      - name: Run the check
+        env:
+          CHECK_RUN: ${{ matrix.run }}
+        run: bash -eo pipefail -c "$CHECK_RUN"
+
+  frontend:
+    needs: plan
+    if: needs.plan.outputs.frontends != '[]'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.frontends) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          lfs: ${{ matrix.lfs }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - name: Set up Node with the pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: ${{ matrix.pnpm-lock }}
+      - run: pnpm install --frozen-lockfile
+      - name: Run the scripts
+        env:
+          CHECK_RUN: ${{ matrix.run }}
+        run: bash -eo pipefail -c "$CHECK_RUN"
+
+  browser:
+    needs: plan
+    if: needs.plan.outputs.browsers != '[]'
+    name: ${{ matrix.name }} (${{ matrix.shard }}/${{ matrix.shards }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.browsers) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ matrix.shards }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          lfs: ${{ matrix.lfs }}
+          persist-credentials: false
+      - name: Set up .NET
+        if: matrix.dotnet
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: ${{ matrix.dotnet-json }}
+          dotnet-version: ${{ matrix.dotnet-version }}
+      - name: Restore the NuGet cache
+        if: matrix.dotnet
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ matrix.slug }}-${{ hashFiles('**/packages.lock.json', '**/*.csproj', '**/Directory.Packages.props', '**/Directory.Build.props', '**/global.json') }}
+          restore-keys: nuget-${{ runner.os }}-${{ matrix.slug }}-
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - name: Set up Node with the pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: ${{ matrix.pnpm-lock }}
+      - run: pnpm install --frozen-lockfile
+      - name: Prepare the browser run
+        if: matrix.setup != ''
+        env:
+          CHECK_SETUP: ${{ matrix.setup }}
+        run: bash -eo pipefail -c "$CHECK_SETUP"
+      - name: Run the browser tests
+        env:
+          CHECK_RUN: ${{ matrix.run }}
+        run: bash -eo pipefail -c "$CHECK_RUN"
+      - name: Keep the failed run's evidence
+        if: failure() && matrix.artifact != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.slug }}-failure-${{ matrix.shard }}
+          path: ${{ matrix.artifact }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+  gate:
+    needs: [plan, backend, frontend, browser]
+    # A superseded push skips the gate, so its run never marks the commit delivered.
+    if: always() && needs.plan.outputs.superseded != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the plan and every selected check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ['RESULTS'])
+          failed = {name: need['result'] for name, need in needs.items()
+                    if need['result'] != 'success' and not (name != 'plan' and need['result'] == 'skipped')}
+          if failed:
+              raise SystemExit('Checks did not pass: ' + json.dumps(failed))
+          print('Every selected check passed' if needs['plan']['outputs'].get('changed') == 'true'
+                else 'Docs only: nothing to verify')
+          PY

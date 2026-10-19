@@ -1,0 +1,4 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>wow-two-platform/wow-two-platform.pipelines//renovate/renovate-product"]
+}

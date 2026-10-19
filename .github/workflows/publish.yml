@@ -6,6 +6,8 @@
 #   commit input  → candidate X.Y.(Z+1)-g<commit> for a commit that has no build (Wheelhouse's Build action)
 # A previous release whose source commit is not in the checked-out history (an author rewrite removed it) is not used
 # as the base: every service rebuilds, and the job log and the release notes say so.
+# Image layers go through the GitHub Actions cache, one scope per service, so unchanged stages are not rebuilt.
+# delivery.yml calls it after ci; a product may still call it directly.
 # Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md § Builds and versions.
 name: publish
 
@@ -22,6 +24,16 @@ on:
         type: string
         required: false
         default: main
+    outputs:
+      status:
+        description: "'built' when the run published a bundle, 'skipped' when no service or descriptor changed"
+        value: ${{ jobs.bundle.outputs.status }}
+      kind:
+        description: "'release' on the main branch, else 'candidate'"
+        value: ${{ jobs.bundle.outputs.kind }}
+      release:
+        description: The release tag or candidate version the run built
+        value: ${{ jobs.bundle.outputs.release }}
 
 jobs:
   bundle:
@@ -31,6 +43,10 @@ jobs:
       contents: write
       packages: write
       actions: read
+    outputs:
+      status: ${{ steps.build.outputs.status }}
+      kind: ${{ steps.build.outputs.kind }}
+      release: ${{ steps.build.outputs.release }}
     concurrency:
       # One build per branch at a time, so a release reads the tag the previous one created.
       group: publish-${{ github.repository }}-${{ inputs.commit || github.ref }}
@@ -62,6 +78,9 @@ jobs:
           python-version: '3.12'
       - run: pip install pyyaml
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Expose the Actions cache to Buildx
+        # The gha cache backend needs the runtime token and cache URL, which only an action can read.
+        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3.1.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -85,7 +104,7 @@ jobs:
         run: |
           set -euo pipefail
           arguments=(ci --repo . --commit "$COMMIT" --main "${{ inputs.main-branch }}"
-                     --registry "ghcr.io/${GITHUB_REPOSITORY,,}" --output bundle)
+                     --registry "ghcr.io/${GITHUB_REPOSITORY,,}" --output bundle --cache gha)
           [ -n "$BRANCH" ] && arguments+=(--branch "$BRANCH")
           python3 .pipelines/generator/release.py "${arguments[@]}" ${BASE_ARGUMENTS:-}
       - name: Publish the release with its notes

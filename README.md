@@ -1,27 +1,35 @@
 # wow-two-platform.pipelines
 
-Shared GitHub Actions for wow-two products: one reusable workflow that versions, builds and publishes a product from
-its `engineering/deployment/deploy.yml`, and the release generator behind it.
+Shared GitHub Actions for wow-two products: one delivery workflow that verifies, versions, builds and publishes a
+product from its `engineering/deployment/deploy.yml`, the CI and publish workflows inside it, CodeQL for public
+repositories, Renovate presets, and the release generator behind them.
 
 | Path | What it is |
 |---|---|
-| `.github/workflows/publish.yml` | The reusable build-and-publish workflow products call |
-| `.github/workflows/test.yml` | This repo's own tests |
+| `.github/workflows/delivery.yml` | A product's whole push delivery: `ci`, then `publish` |
+| `.github/workflows/ci.yml` | The shared CI: plan, backend, frontend, browser, gate |
+| `.github/workflows/publish.yml` | Versions, builds and publishes the changed services |
+| `.github/workflows/codeql.yml` | CodeQL without a build, for public repositories; also scans this one |
+| `.github/workflows/test.yml` | This repo's own tests and workflow lint |
 | `generator/release.py` | The release generator: versions, change detection, builds, bundles |
-| `generator/test_release.py` | Its tests, on throwaway Git repositories |
+| `generator/ci_plan.py` | The CI planner: superseded pushes, docs-only skips, which checks run |
+| `generator/test_release.py`, `generator/test_ci_plan.py` | Their tests, on throwaway Git repositories and a fake GitHub |
+| `renovate/renovate-product.json`, `renovate/renovate-private.json` | Shared Renovate presets |
 
 Rules for versions, tags and bundles: `wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md`.
 
 ## Calling it from a product
 
-`.github/workflows/publish-docker-image.yml` in the product is the marker Wheelhouse keys on:
+`.github/workflows/publish-docker-image.yml` is the product's one workflow and the marker Wheelhouse keys on. It
+declares the product's checks; everything else is shared:
 
 ```yaml
 name: publish-docker-image
 
 on:
   push:
-    branches: ['**']
+    branches: ['**', '!renovate/**']
+  pull_request:
   workflow_dispatch:
     inputs:
       commit:
@@ -33,12 +41,56 @@ permissions:
   packages: write
   actions: read
 
+concurrency:
+  group: delivery-${{ github.repository }}-${{ inputs.commit || github.ref }}
+  # main queues, so each release reads the tag the previous one created; other refs cancel a superseded run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main') }}
+  queue: max
+
 jobs:
-  publish:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.8.1
+  delivery:
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.9.0
     with:
       commit: ${{ inputs.commit }}
+      backends: |
+        [{"name": "Backend", "dotnet": "engineering/codebase/pilot.backend-services/global.json",
+          "node": "engineering/codebase/pilot.frontend-services/.nvmrc",
+          "run": "dotnet test engineering/codebase/pilot.backend-services/Pilot.BackendServices.slnx"}]
+      frontends: |
+        [{"name": "Frontend", "dir": "engineering/codebase/pilot.frontend-services",
+          "scripts": ["lint", "typecheck", "test", "build"]}]
 ```
+
+A push runs `current → plan → ci → publish`:
+
+- **current:** a `main` push that a newer push already replaced verifies and publishes nothing; its gate is skipped.
+- **plan:** reads the paths changed since the last delivered commit (the newest successful push run on the branch
+  whose gate passed). Docs, planning and markdown alone (`**/*.md`, `docs/**`, `product/**`,
+  `engineering/planning/**`, `engineering/research/**`, `.claude/**`, plus the `docs` input) build, test and publish
+  nothing, and the gate still passes. A dispatched commit, a first run or an unreadable answer verifies everything.
+- **ci:** each check with `paths` runs when one of them changed; one without runs on every code change; a changed path
+  no check owns (a workflow, a root file) runs every check.
+- **publish:** after a passing `ci`, on pushes and dispatches, never on a pull request.
+- A product that deploys itself adds a job after `delivery` with
+  `if: needs.delivery.outputs.published == 'true'`; Wheelhouse's `deploy-dev` is the one case.
+
+## Shared CI
+
+`ci.yml` takes its checks as JSON strings. Paths are relative to the repository root; `run` and `setup` are a string or
+a list of lines, run with `bash -eo pipefail`.
+
+| Input | Keys |
+|---|---|
+| `backends` (list) | `name`, `run`; `dir` (`.`), `dotnet` (a `global.json` or an SDK version), `node` (an `.nvmrc`; adds pnpm), `python`, `pip` (install arguments), `pip-cache` (requirements glob), `lfs`, `history` (full clone), `pipelines` (the generator at this tag in `$PIPELINES_DIR`), `paths`, `timeout` (30) |
+| `frontends` (list) | `name`, `dir`; `scripts` (`lint typecheck test build`), `node` (`<dir>/.nvmrc`), `lfs`, `paths`, `timeout` (20) |
+| `browser` (object) | `name`, `dir`, `run` (gets `$SHARD`, `$SHARDS`); `shards` (1), `setup`, `dotnet`, `node`, `lfs`, `artifact` (kept on failure), `paths`, `timeout` (30) |
+| `docs` (list) | extra globs that never build |
+
+- Every .NET job restores a NuGet cache keyed on its lockfiles and project files; every Node job a pnpm store cache.
+- The `gate` job (`ci`'s one result) passes when every selected check passed; it is skipped only on a superseded push.
+- Every job has a timeout; every action is pinned to a commit.
+
+## Publish
 
 | Built from | Version | Image tags | Bundle |
 |---|---|---|---|
@@ -82,11 +134,27 @@ jobs:
   image comes from the base. The job log gets a `::warning` annotation and the release notes lead with
   `**Warning:** Base vX.Y.Z's source commit (<sha>) is not in this history; every service was rebuilt.` A base that
   is in the history plans and bundles byte for byte as before.
+- From `v0.9.0` products call `delivery.yml` instead of `publish.yml` and drop their own `ci.yml` or `verify.yml`.
+  Publish builds through the GitHub Actions layer cache (`release.py ci --cache gha`, `mode=min`, one scope per
+  service; a failed export never fails the build) and outputs `status`, `kind` and `release`. Bundles are byte for
+  byte as before.
+
+## Security checks
+
+- **CodeQL:** a public repository adds `.github/workflows/codeql.yml` calling `codeql.yml@v0.9.0` with its
+  `languages`, on `main` pushes that change more than markdown and weekly. It runs beside delivery, never inside it,
+  and needs `security-events: write`. Private repositories on the Free plan get no code scanning; add nothing there.
+- **Renovate:** each repository's `.github/renovate.json` extends
+  `github>wow-two-platform/wow-two-platform.pipelines//renovate/renovate-product` (public) or `…/renovate-private`
+  (private: nothing is branched until the owner ticks it in the Dependency Dashboard, so no Actions minutes). Mend's
+  hosted Renovate app runs outside Actions; delivery ignores `renovate/**` pushes and verifies their pull requests.
+  Updates come weekly and grouped, wait 3 days after release, and keep commits as `chore: updated <dep> …`; the be
+  sdk, the fe sdk and this repository's tags skip the wait.
 
 ## Running the generator locally
 
 ```bash
 python3 generator/release.py plan --repo <product> --commit HEAD
 python3 generator/release.py notes --repo <product> --commit HEAD --previous v0.4.2
-python3 -B -m unittest -v test_release        # from generator/
+python3 -B -m unittest -v test_release test_ci_plan   # from generator/
 ```

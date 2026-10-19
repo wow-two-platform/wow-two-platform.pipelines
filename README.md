@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   publish:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.3.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.6.0
     with:
       commit: ${{ inputs.commit }}
 ```
@@ -59,6 +59,11 @@ jobs:
 - From `v0.5.0` a descriptor may set `dotnetEnvironment: true` (the runner runs dev as .NET `Development`, prod as
   `Production`) and declare a `verify` dev check (`service`, `command`, `timeout`); each reaches `release.json` only
   when declared, so other bundles stay byte for byte the same. An older tag refuses both keys.
+- From `v0.6.0` a service may declare `dependsOn: [<service>, …]`, other services of the same product (platform
+  services stay under `needs`); an unknown name or a cycle is refused. It renders as Compose
+  `depends_on: { <service>: { condition: service_healthy } }`, never `restart: true`, so Wheelhouse starts a release in
+  dependency order and a dependency's update never restarts its dependents. A bundle that declares none is byte for
+  byte the same; an older tag refuses the key.
 
 ## Running the generator locally
 

@@ -40,7 +40,7 @@ PLATFORMS = ("linux/amd64", "linux/arm64")
 NEEDS = ("postgres", "valkey", "broker")
 EXPOSURES = ("public", "private")
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
-                "needs", "capabilities"}
+                "needs", "capabilities", "dependsOn"}
 TOP_KEYS = {"descriptor", "product", "platform", "shared", "services", "dotnetEnvironment", "verify"}
 # The end-to-end check after a dev rollout: how long it may run, by default and at most.
 VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
@@ -97,6 +97,7 @@ def validate(descriptor):
         unknown = set(service) - SERVICE_KEYS
         check(not unknown, name + ": unknown key " + ", ".join(sorted(map(str, unknown))))
         result["services"][name] = service_of(name, service, claimed)
+    dependency_order(result["services"])
     dotnet = descriptor.get("dotnetEnvironment", False)
     check(type(dotnet) is bool, "dotnetEnvironment must be true or false")
     result["dotnetEnvironment"] = dotnet
@@ -125,6 +126,22 @@ def verify_of(verify, services):
     timeout = seconds(verify.get("timeout", str(VERIFY_TIMEOUT) + "s"), "verify timeout")
     check(10 <= timeout <= VERIFY_TIMEOUT_LIMIT, "verify timeout must be 10s-30m")
     return {"service": verify["service"], "command": command, "timeoutSeconds": timeout}
+
+
+def dependency_order(services):
+    """The services in start order, each after the services it depends on; refuses an unknown service or a cycle.
+    Dependencies name services of this bundle only: platform services (postgres, valkey, broker) go under `needs`."""
+    for name, service in services.items():
+        for other in service["dependsOn"]:
+            check(other in services, name + ": dependsOn must name a service of this product"
+                  + ("; platform services go under needs" if other in NEEDS else ""))
+    placed, order = set(), []
+    while len(order) < len(services):
+        ready = [name for name in services if name not in placed and set(services[name]["dependsOn"]) <= placed]
+        check(ready, "dependsOn forms a cycle: " + ", ".join(sorted(set(services) - placed)))
+        order += ready
+        placed.update(ready)
+    return order
 
 
 def service_of(name, service, claimed):
@@ -182,6 +199,10 @@ def service_of(name, service, claimed):
         sites[site] = entry
     needs = service.get("needs") or []
     check(isinstance(needs, list) and set(needs) <= set(NEEDS), name + ": needs takes postgres, valkey and broker")
+    depends = service.get("dependsOn") or []
+    check(isinstance(depends, list) and all(isinstance(other, str) and SLUG.fullmatch(other) for other in depends)
+          and len(set(depends)) == len(depends), name + ": dependsOn must list service names once each")
+    check(name not in depends, name + ": a service cannot depend on itself")
     capabilities = service.get("capabilities") or []
     check(isinstance(capabilities, list) and all(isinstance(item, str) and CAPABILITY.fullmatch(item) for item in capabilities),
           name + ": capabilities must be Linux capability names")
@@ -196,7 +217,7 @@ def service_of(name, service, claimed):
                       "contexts": {key: relative(path, name + ": build context " + key) for key, path in contexts.items()}},
             "paths": [relative(path, name + ": path") for path in paths], "port": port, "health": test,
             "memory": memory, "stopGrace": grace, "settings": settings, "volumes": volumes, "sites": sites,
-            "needs": needs, "capabilities": capabilities}
+            "needs": needs, "capabilities": capabilities, "dependsOn": depends}
 
 
 # ---------------------------------------------------------------------- change
@@ -361,6 +382,10 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
                       "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}}
         if service["capabilities"]:
             definition["cap_add"] = service["capabilities"]
+        if service["dependsOn"]:
+            # Compose starts the service once each dependency is healthy. No `restart: true`: a dependency's update
+            # never restarts its dependents. Written only when declared, so other bundles stay byte for byte the same.
+            definition["depends_on"] = {other: {"condition": "service_healthy"} for other in sorted(service["dependsOn"])}
         if mounts:
             definition["volumes"] = mounts
         compose_services[name] = definition

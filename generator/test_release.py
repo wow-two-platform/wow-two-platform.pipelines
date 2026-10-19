@@ -71,6 +71,13 @@ class DescriptorTests(unittest.TestCase):
             (lambda d: d.update(verify={"service": "api", "command": ["true"], "timeout": "2h"}), "verify timeout must be"),
             (lambda d: d.update(verify={"service": "api", "command": ["true"], "timeout": 60}), "verify timeout must look"),
             (lambda d: d.update(verify={"service": "api", "command": ["true"], "image": "x"}), "verify takes"),
+            (lambda d: d["services"]["edge"].update(dependsOn="api"), "dependsOn must list"),
+            (lambda d: d["services"]["edge"].update(dependsOn=["api", "api"]), "dependsOn must list"),
+            (lambda d: d["services"]["edge"].update(dependsOn=["edge"]), "cannot depend on itself"),
+            (lambda d: d["services"]["edge"].update(dependsOn=["worker"]), "dependsOn must name a service of this product$"),
+            (lambda d: d["services"]["api"].update(dependsOn=["postgres"]), "platform services go under needs"),
+            (lambda d: (d["services"]["edge"].update(dependsOn=["api"]), d["services"]["api"].update(dependsOn=["edge"])),
+             "dependsOn forms a cycle: api, edge"),
         )
         for mutate, message in cases:
             with self.subTest(message=message):
@@ -104,6 +111,17 @@ class DescriptorTests(unittest.TestCase):
                          descriptor["verify"])
         declared["verify"]["timeout"] = "90s"
         self.assertEqual(90, release.validate(declared)["verify"]["timeoutSeconds"])
+
+    def test_dependencies_are_opt_in_and_ordered(self):
+        self.assertEqual([], release.validate(copy.deepcopy(DESCRIPTOR))["services"]["edge"]["dependsOn"])
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["worker"] = {"build": {"dockerfile": "deployment/backend.Dockerfile"},
+                                          "paths": ["codebase/pilot.worker/**"], "health": "/health",
+                                          "dependsOn": ["api", "edge"]}
+        declared["services"]["edge"]["dependsOn"] = ["api"]
+        descriptor = release.validate(declared)
+        self.assertEqual(["api", "edge"], descriptor["services"]["worker"]["dependsOn"])
+        self.assertEqual(["api", "edge", "worker"], release.dependency_order(descriptor["services"]))
 
     @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
     def test_a_yaml_descriptor_parses(self):
@@ -198,9 +216,24 @@ class PlanTests(unittest.TestCase):
         self.assertEqual((["NET_BIND_SERVICE"], ["ALL"]), (edge["cap_add"], edge["cap_drop"]))
         self.assertEqual({"keys": {}}, compose["volumes"])
         self.assertEqual("main", manifest["branch"])
-        # Neither opt-in is declared, so the bundle carries neither key.
+        # Neither opt-in is declared, so the bundle carries neither key, and no service depends on another.
         self.assertNotIn("dotnetEnvironment", written)
         self.assertNotIn("verify", written)
+        self.assertEqual(set(), {name for name, service in compose["services"].items() if "depends_on" in service})
+
+    def test_declared_dependencies_render_as_health_gated_compose_dependencies(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["edge"]["dependsOn"] = ["api"]
+        descriptor = release.validate(declared)
+        planned = release.plan(descriptor, self.repo, self.first, None)
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+        compose_bytes, manifest = release.render(descriptor, planned, images)
+        compose = json.loads(compose_bytes)
+        # Health-gated, and never `restart: true`: a dependency's update does not restart its dependents.
+        self.assertEqual({"api": {"condition": "service_healthy"}}, compose["services"]["edge"]["depends_on"])
+        self.assertNotIn("depends_on", compose["services"]["api"])
+        # Compose carries the order; the manifest needs no second copy of it.
+        self.assertNotIn("dependsOn", json.dumps(manifest))
 
     def test_a_bundle_carries_the_declared_environment_mapping_and_dev_check(self):
         declared = copy.deepcopy(DESCRIPTOR)

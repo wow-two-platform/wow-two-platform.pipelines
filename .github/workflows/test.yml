@@ -44,3 +44,28 @@ jobs:
           docker run --rm -e SHELLCHECK_OPTS=--severity=warning -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12
           -color -ignore 'property "workflow_(repository|sha)" is not defined'
           -ignore 'property "result" is not defined in object type \{outputs'
+
+  buildx-cache:
+    name: Buildx layer cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3.1.0
+      # The cache flags publish passes (release.py build_image, cache "gha") on a throwaway image: export, then import.
+      - name: Build twice through the gha cache
+        run: |
+          set -euo pipefail
+          context=$(mktemp -d)
+          printf 'FROM busybox:1.37\nRUN echo "%s" > /stamp\n' "$GITHUB_RUN_ID" > "$context/Dockerfile"
+          flags=$(python3 -c 'import sys; sys.path.insert(0, "generator"); import release; print(" ".join(release.cache_flags("gha", "smoke")))')
+          # shellcheck disable=SC2086
+          docker buildx build $flags --load -t cache-smoke "$context"
+          # Empty the builder, so the second build can only reuse its layer through the gha cache.
+          docker buildx prune --all --force
+          # shellcheck disable=SC2086
+          docker buildx build $flags --load -t cache-smoke "$context" 2>&1 | tee "$RUNNER_TEMP/second.log"
+          grep -q 'CACHED' "$RUNNER_TEMP/second.log"

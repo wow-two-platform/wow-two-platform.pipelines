@@ -608,6 +608,15 @@ def push_local(reference, repository, tag):
     return next(item for item in digests if item.startswith(repository + "@"))
 
 
+def cache_flags(cache, scope):
+    """Buildx flags for a layer cache: "gha" reads and writes one GitHub Actions cache scope per service. mode=min keeps
+    the final image's layers (system packages, runtimes), which rarely change; a failed export never fails the build."""
+    if cache != "gha":
+        return []
+    return ["--cache-from", "type=gha,scope=" + scope,
+            "--cache-to", "type=gha,mode=min,scope=" + scope + ",ignore-error=true"]
+
+
 def build_image(descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None, cache=None):
     """Builds and pushes one service; `cache` "gha" reads and writes its layers in the GitHub Actions cache."""
     service = descriptor["services"][name]["build"]
@@ -628,11 +637,7 @@ def build_image(descriptor, name, checkout, repository, tag, app_version=None, v
             arguments += ["--build-arg", "VCS_REF=" + vcs_ref]
         for key, path in sorted(service["contexts"].items()):
             arguments += ["--build-context", key + "=" + str(engineering / path)]
-        if cache == "gha":
-            # One cache scope per service. mode=min keeps the final image's layers (system packages, runtimes), which
-            # rarely change; a failed export never fails the build.
-            arguments += ["--cache-from", "type=gha,scope=" + name,
-                          "--cache-to", "type=gha,mode=min,scope=" + name + ",ignore-error=true"]
+        arguments += cache_flags(cache, name)
         docker(*arguments, str(engineering / service["context"]))
         digest = json.loads(metadata.read_text()).get("containerimage.digest", "")
     check(re.fullmatch(r"sha256:[a-f0-9]{64}", digest), name + ": the build reported no image digest")

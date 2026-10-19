@@ -724,7 +724,7 @@ class CiTests(unittest.TestCase):
         git(self.repo, "commit", "-q", "-m", "first")
         self.commit = git(self.repo, "rev-parse", "HEAD")
         self.descriptor = release.validate(copy.deepcopy(DESCRIPTOR))
-        self.built, self.moved = [], []
+        self.built, self.moved, self.caches = [], [], []
         self.stubs = [unittest.mock.patch.object(release, "build_image", self.fake_build),
                       unittest.mock.patch.object(release, "move_tag", lambda image, tag: self.moved.append((image, tag)))]
         for stub in self.stubs:
@@ -742,13 +742,14 @@ class CiTests(unittest.TestCase):
             stub.stop()
         self.temporary.cleanup()
 
-    def fake_build(self, descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None):
+    def fake_build(self, descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None, cache=None):
         self.built.append((name, tag, app_version, vcs_ref))
+        self.caches.append(cache)
         return repository + "@sha256:" + hashlib.sha256((name + tag).encode()).hexdigest()
 
-    def run_ci(self, branch, base=None):
+    def run_ci(self, branch, base=None, cache=None):
         arguments = argparse.Namespace(repo=str(self.repo), branch=branch, main="main", registry="ghcr.io/o/pilot",
-                                       output="bundle", rollback_compatible=False)
+                                       output="bundle", rollback_compatible=False, cache=cache)
         with contextlib.redirect_stdout(io.StringIO()) as printed, contextlib.redirect_stderr(io.StringIO()) as logged:
             release.ci(arguments, self.commit, self.descriptor, base)
         self.logged = logged.getvalue()
@@ -802,6 +803,13 @@ class CiTests(unittest.TestCase):
         self.assertNotIn("warning", result)
         self.assertEqual("", self.logged)
 
+    def test_the_layer_cache_reaches_every_build_and_no_cache_is_the_default(self):
+        self.run_ci("main")
+        self.assertEqual([None, None], self.caches)
+        self.caches.clear()
+        self.run_ci("main", cache="gha")
+        self.assertEqual(["gha", "gha"], self.caches)
+
     def test_a_push_that_changes_nothing_is_skipped(self):
         base = {"product": "pilot", "release": "v0.4.0", "sourceCommit": self.commit,
                 "images": {"api": "ghcr.io/o/pilot/api" + DIGEST, "edge": "ghcr.io/o/pilot/edge" + DIGEST}}
@@ -830,6 +838,25 @@ class BuildImageTests(unittest.TestCase):
         arguments = list(calls[0])
         build_args = [arguments[index + 1] for index, item in enumerate(arguments) if item == "--build-arg"]
         self.assertEqual(["SERVICE=Api", "APP_VERSION=0.4.0", "VCS_REF=" + commit], build_args)
+        self.assertNotIn("--cache-from", arguments)
+
+    def test_the_gha_cache_reads_and_writes_one_scope_per_service_and_never_fails_the_build(self):
+        calls = []
+
+        def fake_docker(*arguments):
+            calls.append(arguments)
+            Path(arguments[arguments.index("--metadata-file") + 1]).write_text(
+                json.dumps({"containerimage.digest": DIGEST[1:]}))
+            return ""
+
+        descriptor = release.validate(copy.deepcopy(DESCRIPTOR))
+        with unittest.mock.patch.object(release, "docker", fake_docker):
+            release.build_image(descriptor, "api", "/checkout", "ghcr.io/o/pilot/api", "0.4.0", "0.4.0", "c" * 40,
+                                "gha")
+        arguments = list(calls[0])
+        self.assertEqual("type=gha,scope=api", arguments[arguments.index("--cache-from") + 1])
+        self.assertEqual("type=gha,mode=min,scope=api,ignore-error=true", arguments[arguments.index("--cache-to") + 1])
+        self.assertEqual("/checkout/engineering/codebase", arguments[-1])
 
 
 if __name__ == "__main__":

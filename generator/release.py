@@ -608,7 +608,8 @@ def push_local(reference, repository, tag):
     return next(item for item in digests if item.startswith(repository + "@"))
 
 
-def build_image(descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None):
+def build_image(descriptor, name, checkout, repository, tag, app_version=None, vcs_ref=None, cache=None):
+    """Builds and pushes one service; `cache` "gha" reads and writes its layers in the GitHub Actions cache."""
     service = descriptor["services"][name]["build"]
     engineering = Path(checkout) / "engineering"
     with tempfile.TemporaryDirectory() as directory:
@@ -627,6 +628,11 @@ def build_image(descriptor, name, checkout, repository, tag, app_version=None, v
             arguments += ["--build-arg", "VCS_REF=" + vcs_ref]
         for key, path in sorted(service["contexts"].items()):
             arguments += ["--build-context", key + "=" + str(engineering / path)]
+        if cache == "gha":
+            # One cache scope per service. mode=min keeps the final image's layers (system packages, runtimes), which
+            # rarely change; a failed export never fails the build.
+            arguments += ["--cache-from", "type=gha,scope=" + name,
+                          "--cache-to", "type=gha,mode=min,scope=" + name + ",ignore-error=true"]
         docker(*arguments, str(engineering / service["context"]))
         digest = json.loads(metadata.read_text()).get("containerimage.digest", "")
     check(re.fullmatch(r"sha256:[a-f0-9]{64}", digest), name + ": the build reported no image digest")
@@ -639,7 +645,7 @@ def move_tag(image, tag):
     docker("buildx", "imagetools", "create", "--tag", repository + ":" + tag, image)
 
 
-def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=None, app_version=None):
+def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=None, app_version=None, cache=None):
     """Builds and pushes every planned service; returns each service's digest-pinned image."""
     images = {name: entry["image"] for name, entry in planned["services"].items() if not entry["build"]}
     tag = tag or (planned["release"][1:] if planned["kind"] == "release" else planned["release"])
@@ -655,7 +661,7 @@ def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=
                 worktree = tempfile.mkdtemp(prefix="wheelhouse-build-")
                 git(repo, "worktree", "add", "--detach", worktree, planned["sourceCommit"])
             images[name] = build_image(descriptor, name, checkout or worktree, repository, tag, app_version,
-                                       planned["sourceCommit"])
+                                       planned["sourceCommit"], cache)
     finally:
         if worktree:
             subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", worktree], capture_output=True)
@@ -729,6 +735,7 @@ def main():
     parser.add_argument("--archive", help="also write a .tar.gz of the bundle for import")
     parser.add_argument("--previous", help="notes: the previous release's tag; the notes list the commits since it")
     parser.add_argument("--warning", help="notes: a line the notes lead with, the build's base warning")
+    parser.add_argument("--cache", choices=["gha"], help="build, ci: read and write image layers in this cache")
     args = parser.parse_args()
     try:
         if args.action == "validate":
@@ -753,7 +760,8 @@ def main():
         check(args.registry and args.output, "build needs --registry and --output")
         local_images = dict(item.split("=", 1) for item in args.image)
         check(set(local_images) <= set(descriptor["services"]), "--image names an unknown service")
-        images = build(descriptor, planned, args.repo, args.registry, local_images, args.repo if args.checkout else None)
+        images = build(descriptor, planned, args.repo, args.registry, local_images, args.repo if args.checkout else None,
+                       cache=args.cache)
         compose_bytes, manifest = render(descriptor, planned, images, args.branch, args.rollback_compatible)
         write_bundle(args.output, compose_bytes, manifest, args.archive)
         print(json.dumps({"release": manifest["release"], "kind": manifest["kind"], "output": args.output,
@@ -782,7 +790,7 @@ def ci(args, commit, descriptor, base):
         result.update(status="skipped", archive="")
     else:
         images = build(descriptor, planned, args.repo, args.registry, {}, args.repo, identity["tag"],
-                       identity["version"])
+                       identity["version"], getattr(args, "cache", None))
         if identity["moving"]:
             for image in images.values():
                 move_tag(image, identity["moving"])

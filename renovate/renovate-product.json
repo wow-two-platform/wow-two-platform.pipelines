@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "wow-two repositories: grouped weekly updates; the own SDKs and the pipelines tag without the release-age wait",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Asia/Tashkent",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "dependencyDashboard": true,
+  "prConcurrentLimit": 5,
+  "minimumReleaseAge": "3 days",
+  "semanticCommits": "disabled",
+  "commitMessagePrefix": "chore:",
+  "commitMessageAction": "updated",
+  "commitMessageTopic": "{{depName}}",
+  "packageRules": [
+    {
+      "description": "GitHub Actions in one pull request",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Non-major NuGet updates together",
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "NuGet non-major"
+    },
+    {
+      "description": "Non-major npm updates together",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "npm non-major"
+    },
+    {
+      "description": "Base images together",
+      "matchManagers": [
+        "dockerfile",
+        "docker-compose"
+      ],
+      "groupName": "container images"
+    },
+    {
+      "description": "Own packages and the pipelines tag, last so it wins: no wait, any time, one group, tags kept",
+      "matchPackageNames": [
+        "/^WoW2\\.Sdk\\.Beta(\\.|$)/",
+        "@wow-two-beta/**",
+        "wow-two-platform/wow-two-platform.pipelines"
+      ],
+      "groupName": "wow-two",
+      "minimumReleaseAge": "0 days",
+      "schedule": [
+        "at any time"
+      ],
+      "pinDigests": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "A workflow that checks out the release generator at a pipelines tag",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "repository: (?<depName>wow-two-platform/wow-two-platform\\.pipelines)\\s+ref: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-tags"
+    }
+  ]
+}

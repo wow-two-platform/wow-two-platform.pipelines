@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   delivery:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.9.1
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.10.0
     with:
       commit: ${{ inputs.commit }}
       backends: |
@@ -142,10 +142,16 @@ a list of lines, run with `bash -eo pipefail`.
   byte as before.
 - From `v0.9.1` every action in the shared workflows runs on Node 24 (checkout 7, setup-node 7, setup-dotnet 6,
   setup-python 7, cache 6, upload-artifact 7, pnpm/action-setup 6, docker buildx 4, login 4). Behavior is unchanged.
+- From `v0.10.0` a service may type its setting keys under `settings.keys`: each `type` (`text`, `number`, `boolean`,
+  `choice` with `values`, `url`, `cron`, `date` with a `format`, `email`), `required` or `secret`, and a `default` for
+  an optional plain key, checked against its type. Required keys join `settings.required`; the bundle's
+  `release.json` carries the rest under `settings.<service>` (`optional`, `secrets`, `allowed`, `types`), which
+  Wheelhouse's runner reads and its console checks saved values against. A bundle without typed keys is byte for byte
+  as before; an older tag refuses the key, and a runner older than Wheelhouse v0.5 refuses `types`.
 
 ## Security checks
 
-- **CodeQL:** a public repository adds `.github/workflows/codeql.yml` calling `codeql.yml@v0.9.1` with its
+- **CodeQL:** a public repository adds `.github/workflows/codeql.yml` calling `codeql.yml@v0.10.0` with its
   `languages`, on `main` pushes that change more than markdown and weekly. It runs beside delivery, never inside it,
   and needs `security-events: write`. Private repositories on the Free plan get no code scanning; add nothing there.
 - **Renovate:** each repository's `.github/renovate.json` extends

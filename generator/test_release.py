@@ -131,6 +131,66 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(["api", "edge"], descriptor["services"]["worker"]["dependsOn"])
         self.assertEqual(["api", "edge", "worker"], release.dependency_order(descriptor["services"]))
 
+    def test_typed_keys_join_the_required_list_and_take_checked_defaults(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {
+            "Billing:Mode": {"type": "choice", "values": ["test", "live"], "default": "test"},
+            "Stripe:ApiKey": {"secret": True, "required": True},
+            "Jobs:Cleanup": {"type": "cron", "default": "0 3 * * *"},
+            "Promo:EndsOn": {"type": "date", "format": "dd.MM.yyyy"},
+            "Limits:MaxUsers": {"type": "number", "default": 50},
+            "Features:Beta": {"type": "boolean", "default": False},
+            "Support:Url": {"type": "url", "required": True},
+            "Support:Email": {"type": "email"},
+            "Notes:Banner": None,
+        }
+        settings = release.validate(declared)["services"]["api"]["settings"]
+        self.assertEqual(["Database:Connection", "Stripe:ApiKey", "Support:Url"], settings["required"])
+        keys = settings["keys"]
+        self.assertEqual({"type": "choice", "required": False, "secret": False, "default": "test", "values": ["test", "live"]},
+                         keys["Billing:Mode"])
+        self.assertEqual(("50", "false"), (keys["Limits:MaxUsers"]["default"], keys["Features:Beta"]["default"]))
+        self.assertEqual("dd.MM.yyyy", keys["Promo:EndsOn"]["format"])
+        self.assertEqual({"type": "text", "required": False, "secret": False}, keys["Notes:Banner"])
+        # A descriptor without typed keys validates as it always did.
+        self.assertNotIn("keys", release.validate(copy.deepcopy(DESCRIPTOR))["services"]["api"]["settings"])
+
+    def test_typed_key_rule_breaks_name_the_rule(self):
+        cases = (
+            ({"Bad Key": {}}, "must be a configuration path"),
+            ({"A:B": {"type": "colour"}}, "type must be one of"),
+            ({"A:B": {"kind": "text"}}, "takes type, required, secret"),
+            ({"A:B": {"type": "choice"}}, "a choice lists 1-50 values"),
+            ({"A:B": {"type": "choice", "values": ["x", "x"]}}, "must be distinct"),
+            ({"A:B": {"values": ["x"]}}, "only a choice lists values"),
+            ({"A:B": {"format": "yyyy"}}, "only a date takes a format"),
+            ({"A:B": {"type": "date", "format": "%Y-%m"}}, "a date format uses"),
+            ({"A:B": {"secret": True, "default": "x"}}, "a secret takes no default"),
+            ({"A:B": {"required": True, "default": "x"}}, "a required key takes no default"),
+            ({"A:B": {"required": "yes"}}, "required and secret must be true or false"),
+            ({"A:B": {"type": "number", "default": "ten"}}, "default must be a number"),
+            ({"A:B": {"type": "boolean", "default": "yes"}}, "default must be true or false"),
+            ({"A:B": {"type": "choice", "values": ["a"], "default": "b"}}, "default must be one of the values"),
+            ({"A:B": {"type": "url", "default": "example.com"}}, "default must be an absolute http"),
+            ({"A:B": {"type": "cron", "default": "61 * * * *"}}, "default must be a cron expression"),
+            ({"A:B": {"type": "date", "default": "2026-02-30"}}, "default must be a date as yyyy-MM-dd"),
+            ({"A:B": {"type": "email", "default": "owner"}}, "default must be an email address"),
+            ([], "settings keys must map keys"),
+        )
+        for keys, message in cases:
+            with self.subTest(message=message):
+                declared = copy.deepcopy(DESCRIPTOR)
+                declared["services"]["api"]["settings"]["keys"] = keys
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(declared)
+
+    def test_cron_takes_five_or_six_fields_names_steps_and_macros(self):
+        for value in ("0 3 * * *", "*/15 9-17 * * MON-FRI", "0 0 1 JAN,JUL *", "0 30 2 L * ?", "0 0 * * 5#2", "@daily"):
+            self.assertTrue(release.is_cron(value), value)
+        for value in ("", "* * * *", "60 * * * *", "* 24 * * *", "0 0 0 * *", "5-1 * * * *", "*/0 * * * *", "@often",
+                      " 0 3 * * *"):
+            self.assertFalse(release.is_cron(value), value)
+
     @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
     def test_a_yaml_descriptor_parses(self):
         text = "descriptor: 1\nproduct: pilot\nservices:\n  api:\n    build: {dockerfile: deployment/Dockerfile}\n" \
@@ -503,6 +563,27 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("depends_on", compose["services"]["api"])
         # Compose carries the order; the manifest needs no second copy of it.
         self.assertNotIn("dependsOn", json.dumps(manifest))
+
+    def test_a_bundle_carries_typed_keys_for_the_runner_and_untyped_bundles_stay_the_same(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {
+            "Billing:Mode": {"type": "choice", "values": ["test", "live"], "default": "test"},
+            "Stripe:ApiKey": {"secret": True, "required": True},
+            "Promo:EndsOn": {"type": "date"},
+        }
+        descriptor = release.validate(declared)
+        planned = release.plan(descriptor, self.repo, self.first, None)
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+        _, manifest = release.render(descriptor, planned, images)
+        self.assertEqual({"api": ["Database:Connection", "Stripe:ApiKey"]}, manifest["requiredConfiguration"])
+        self.assertEqual({"api": {"optional": {"Billing:Mode": "test"}, "secrets": ["Stripe:ApiKey"],
+                                  "allowed": {"Billing:Mode": ["test", "live"]},
+                                  "types": {"Billing:Mode": {"type": "choice"}, "Stripe:ApiKey": {"type": "text"},
+                                            "Promo:EndsOn": {"type": "date", "format": "yyyy-MM-dd"}}}},
+                         manifest["settings"])
+        plain = release.validate(copy.deepcopy(DESCRIPTOR))
+        _, untyped = release.render(plain, release.plan(plain, self.repo, self.first, None), images)
+        self.assertNotIn("settings", untyped)
 
     def test_a_bundle_carries_the_declared_environment_mapping_and_dev_check(self):
         declared = copy.deepcopy(DESCRIPTOR)

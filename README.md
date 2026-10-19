@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   delivery:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.9.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.9.1
     with:
       commit: ${{ inputs.commit }}
       backends: |
@@ -140,10 +140,12 @@ a list of lines, run with `bash -eo pipefail`.
   Publish builds through the GitHub Actions layer cache (`release.py ci --cache gha`, `mode=min`, one scope per
   service; a failed export never fails the build) and outputs `status`, `kind` and `release`. Bundles are byte for
   byte as before.
+- From `v0.9.1` every action in the shared workflows runs on Node 24 (checkout 7, setup-node 7, setup-dotnet 6,
+  setup-python 7, cache 6, upload-artifact 7, pnpm/action-setup 6, docker buildx 4, login 4). Behavior is unchanged.
 
 ## Security checks
 
-- **CodeQL:** a public repository adds `.github/workflows/codeql.yml` calling `codeql.yml@v0.9.0` with its
+- **CodeQL:** a public repository adds `.github/workflows/codeql.yml` calling `codeql.yml@v0.9.1` with its
   `languages`, on `main` pushes that change more than markdown and weekly. It runs beside delivery, never inside it,
   and needs `security-events: write`. Private repositories on the Free plan get no code scanning; add nothing there.
 - **Renovate:** each repository's `.github/renovate.json` extends

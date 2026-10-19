@@ -78,7 +78,7 @@ jobs:
       browsers: ${{ steps.plan.outputs.browsers }}
     steps:
       - name: Check out the CI planner at this workflow's own commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -114,7 +114,7 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit || github.sha }}
           fetch-depth: ${{ matrix.fetch-depth }}
@@ -128,7 +128,7 @@ jobs:
           if [ "$LFS_INCLUDE" = '*' ]; then git lfs pull; else git lfs pull --include="$LFS_INCLUDE"; fi
       - name: Check out the release generator at this workflow's own commit
         if: matrix.pipelines
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -140,32 +140,32 @@ jobs:
         run: echo "PIPELINES_DIR=$GITHUB_WORKSPACE/.pipelines" >> "$GITHUB_ENV"
       - name: Set up .NET
         if: matrix.dotnet
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           global-json-file: ${{ matrix.dotnet-json }}
           dotnet-version: ${{ matrix.dotnet-version }}
       - name: Restore the NuGet cache
         if: matrix.dotnet
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ matrix.slug }}-${{ hashFiles('**/packages.lock.json', '**/*.csproj', '**/Directory.Packages.props', '**/Directory.Build.props', '**/global.json') }}
           restore-keys: nuget-${{ runner.os }}-${{ matrix.slug }}-
       - name: Set up pnpm
         if: matrix.node != ''
-        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ inputs.pnpm-version }}
       - name: Set up Node with the pnpm cache
         if: matrix.node != ''
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ matrix.node }}
           cache: pnpm
           cache-dependency-path: ${{ matrix.pnpm-lock }}
       - name: Set up Python
         if: matrix.python != ''
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
           cache: ${{ matrix.pip-cache != '' && 'pip' || '' }}
@@ -197,7 +197,7 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit || github.sha }}
       - name: Fetch the Git LFS files the check reads
@@ -208,11 +208,11 @@ jobs:
         run: |
           git lfs install --local
           if [ "$LFS_INCLUDE" = '*' ]; then git lfs pull; else git lfs pull --include="$LFS_INCLUDE"; fi
-      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ inputs.pnpm-version }}
       - name: Set up Node with the pnpm cache
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ matrix.node }}
           cache: pnpm
@@ -240,7 +240,7 @@ jobs:
       SHARD: ${{ matrix.shard }}
       SHARDS: ${{ matrix.shards }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit || github.sha }}
       - name: Fetch the Git LFS files the check reads
@@ -253,22 +253,22 @@ jobs:
           if [ "$LFS_INCLUDE" = '*' ]; then git lfs pull; else git lfs pull --include="$LFS_INCLUDE"; fi
       - name: Set up .NET
         if: matrix.dotnet
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           global-json-file: ${{ matrix.dotnet-json }}
           dotnet-version: ${{ matrix.dotnet-version }}
       - name: Restore the NuGet cache
         if: matrix.dotnet
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ matrix.slug }}-${{ hashFiles('**/packages.lock.json', '**/*.csproj', '**/Directory.Packages.props', '**/Directory.Build.props', '**/global.json') }}
           restore-keys: nuget-${{ runner.os }}-${{ matrix.slug }}-
-      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ inputs.pnpm-version }}
       - name: Set up Node with the pnpm cache
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ matrix.node }}
           cache: pnpm

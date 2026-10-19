@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   publish:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.7.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.8.0
     with:
       commit: ${{ inputs.commit }}
 ```
@@ -68,6 +68,13 @@ jobs:
   another path; older tags mount it at `/app/appsettings.Local.json`, which is now a developer machine's own file. The be
   sdk reads the target's file (`AddSettingsFiles`, called by `AddApiDefaults`) and, for one release window, a legacy
   `appsettings.Local.json` on a deployed host without it. Move the pin together with that be sdk.
+- From `v0.8.0` a descriptor may be `descriptor: 2`: the product lists its `sites` (host roles with `exposure`,
+  `primary` and `environments`) at the top, and each service lists the `paths` it serves per site. The generator
+  refuses an undeclared site, a site no service serves, a second claim on one site path (one service serves `/` per
+  site) and a path other than `/` or `/a/b`; `validate` warns about a site without `/`. A descriptor 2 bundle writes
+  `release.json` schema 2 (`sites` the roles, `routes` each service's ports and paths); Wheelhouse's runner routes it
+  by host and path, longest prefix first. Descriptor 1 is deprecated and keeps its schema 1 bundles byte for byte;
+  an older tag refuses descriptor 2.
 
 ## Running the generator locally
 

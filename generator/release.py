@@ -5,7 +5,9 @@ A product version is X.Y.Z: X.Y is the newest engineering/planning/version-track
 after the highest vX.Y.* tag. A build of `main` is a release vX.Y.Z; a build of `dev` replaces that branch's previous
 build; any other branch, or a dispatched commit, builds a candidate. Only services whose paths changed since
 the base release rebuild; the rest keep the base release's image and version, so each service carries the version in
-which it last changed. Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md.
+which it last changed. Descriptor 2 declares the product's sites at the top and the paths each service serves per site;
+descriptor 1 (one path per service site) still reads and keeps its bundles byte for byte.
+Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md.
 Requires Python 3.9+, Git and, for `build` / `ci`, Docker with Buildx; the descriptor parser needs PyYAML.
 """
 from __future__ import annotations
@@ -36,15 +38,19 @@ MEMORY = re.compile(r"[1-9][0-9]*[kmg]")
 DURATION = re.compile(r"[1-9][0-9]*[smh]")
 CAPABILITY = re.compile(r"[A-Z][A-Z_]{1,31}")
 SITE_PATH = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*(?:[A-Za-z0-9._~-]+)?")
+# A descriptor 2 site path: `/`, or segments without a trailing slash; `.` and `..` segments are refused apart.
+ROUTE_PATH = re.compile(r"/|(?:/[A-Za-z0-9._~-]+)+")
 PLATFORMS = ("linux/amd64", "linux/arm64")
 NEEDS = ("postgres", "valkey", "broker")
 EXPOSURES = ("public", "private")
+ENVIRONMENTS = ("dev", "prod")
+SITE_KEYS = {"exposure", "primary", "environments"}
 # Where a service's private settings file mounts unless its descriptor names a path; the .NET host reads it after
 # appsettings.{Environment}.json. Bundles before v0.7.0 mounted /app/appsettings.Local.json, now a machine's own file.
 SETTINGS_FILE = "/app/appsettings.Target.json"
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
                 "needs", "capabilities", "dependsOn"}
-TOP_KEYS = {"descriptor", "product", "platform", "shared", "services", "dotnetEnvironment", "verify"}
+TOP_KEYS = {"descriptor", "product", "platform", "shared", "sites", "services", "dotnetEnvironment", "verify"}
 # The end-to-end check after a dev rollout: how long it may run, by default and at most.
 VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
 
@@ -82,7 +88,9 @@ def validate(descriptor):
     check(isinstance(descriptor, dict), "deploy.yml must be a mapping")
     unknown = set(descriptor) - TOP_KEYS
     check(not unknown, "Unknown top-level key: " + ", ".join(sorted(map(str, unknown))))
-    check(descriptor.get("descriptor") == 1, "descriptor must be 1")
+    version = descriptor.get("descriptor")
+    check(type(version) is int and version in (1, 2), "descriptor must be 1 or 2")
+    check(version == 2 or "sites" not in descriptor, "Top-level sites need descriptor 2")
     check(isinstance(descriptor.get("product"), str) and SLUG.fullmatch(descriptor["product"]),
           "product must be a lowercase slug")
     platform = descriptor.get("platform", "linux/amd64")
@@ -91,15 +99,22 @@ def validate(descriptor):
     check(isinstance(shared, list), "shared must be a list of paths")
     services = descriptor.get("services")
     check(isinstance(services, dict) and services, "services must name at least one service")
-    result = {"descriptor": 1, "product": descriptor["product"], "platform": platform,
+    result = {"descriptor": version, "product": descriptor["product"], "platform": platform,
               "shared": [relative(path, "shared path") for path in shared], "services": {}}
-    claimed = set()
+    roles = sites_of(descriptor.get("sites")) if version == 2 else None
+    # (site, path) -> the service that serves it: every request a site answers has exactly one destination.
+    claimed = {}
     for name, service in services.items():
         check(isinstance(name, str) and SLUG.fullmatch(name), "Service names must be lowercase slugs")
         check(isinstance(service, dict), name + ": a service must be a mapping")
         unknown = set(service) - SERVICE_KEYS
         check(not unknown, name + ": unknown key " + ", ".join(sorted(map(str, unknown))))
-        result["services"][name] = service_of(name, service, claimed)
+        result["services"][name] = service_of(name, service, claimed, roles)
+    if roles is not None:
+        served = {site for site, _ in claimed}
+        idle = [site for site in roles if site not in served]
+        check(not idle, "No service serves site " + ", ".join(idle))
+        result["sites"] = roles
     dependency_order(result["services"])
     dotnet = descriptor.get("dotnetEnvironment", False)
     check(type(dotnet) is bool, "dotnetEnvironment must be true or false")
@@ -131,6 +146,56 @@ def verify_of(verify, services):
     return {"service": verify["service"], "command": command, "timeoutSeconds": timeout}
 
 
+def sites_of(declared):
+    """Descriptor 2's product sites: host roles Wheelhouse binds to one host per environment. Each takes `exposure`
+    (public by default), `primary` (the front door; the first site unless one says so) and `environments` (both by
+    default). Hosts, zones and proxying never appear here."""
+    declared = {} if declared is None else declared
+    check(isinstance(declared, dict), "sites must map site names to their options")
+    result = {}
+    for site, options in declared.items():
+        check(isinstance(site, str) and SLUG.fullmatch(site), "Site names must be lowercase slugs")
+        options = {} if options is None else options
+        check(isinstance(options, dict) and set(options) <= SITE_KEYS,
+              "site " + site + ": takes exposure, primary and environments")
+        exposure = options.get("exposure", "public")
+        check(exposure in EXPOSURES, "site " + site + ": exposure must be public or private")
+        check(type(options.get("primary", False)) is bool, "site " + site + ": primary must be true or false")
+        environments = options.get("environments", list(ENVIRONMENTS))
+        check(isinstance(environments, list) and environments and all(item in ENVIRONMENTS for item in environments)
+              and len(set(environments)) == len(environments),
+              "site " + site + ": environments must list dev, prod or both")
+        result[site] = {"exposure": exposure, "primary": options.get("primary", False),
+                        "environments": [item for item in ENVIRONMENTS if item in environments]}
+    primaries = [site for site, options in result.items() if options["primary"]]
+    check(len(primaries) <= 1, "Only one site may be primary: " + ", ".join(primaries))
+    if result and not primaries:
+        result[next(iter(result))]["primary"] = True
+    return result
+
+
+def route_path(value, what):
+    """A descriptor 2 site path: `/` or `/a/b`, no trailing slash, no `.` or `..` segment. The longest prefix wins,
+    and `/api` serves `/api` and `/api/…`, never `/apiary`."""
+    check(isinstance(value, str) and len(value) <= 200 and ROUTE_PATH.fullmatch(value)
+          and not {".", ".."} & set(value.split("/")),
+          what + " must look like / or /api: letters, digits and . _ ~ - between slashes, no trailing slash")
+    return value
+
+
+def site_warnings(descriptor):
+    """What the generator warns about without refusing: a site no service serves at `/` answers 404 outside its
+    paths."""
+    if descriptor.get("descriptor") != 2:
+        return []
+    paths = {}
+    for service in descriptor["services"].values():
+        for site, entry in service["sites"].items():
+            paths.setdefault(site, []).extend(entry["paths"])
+    return ["site " + site + " has no / path: its host answers 404 outside " + ", ".join(sorted(found))
+            for site, found in paths.items() if "/" not in found]
+
+
 def dependency_order(services):
     """The services in start order, each after the services it depends on; refuses an unknown service or a cycle.
     Dependencies name services of this bundle only: platform services (postgres, valkey, broker) go under `needs`."""
@@ -147,7 +212,7 @@ def dependency_order(services):
     return order
 
 
-def service_of(name, service, claimed):
+def service_of(name, service, claimed, roles=None):
     build = service.get("build")
     check(isinstance(build, dict) and set(build) <= {"dockerfile", "context", "target", "args", "contexts"},
           name + ": build takes dockerfile, context, target, args and contexts")
@@ -186,19 +251,38 @@ def service_of(name, service, claimed):
     check(isinstance(volumes, dict) and all(isinstance(key, str) and SLUG.fullmatch(key) and isinstance(path, str)
                                             and path.startswith("/") for key, path in volumes.items()),
           name + ": volumes must map slugs to absolute paths")
+    declared_sites = service.get("sites") or {}
+    check(isinstance(declared_sites, dict), name + ": sites must map site names to their options")
     sites = {}
-    for site, options in (service.get("sites") or {}).items():
+    for site, options in declared_sites.items():
         options = options or {}
-        check(isinstance(site, str) and SLUG.fullmatch(site) and isinstance(options, dict)
-              and set(options) <= {"port", "path", "exposure"}, name + ": sites map slugs to port, path and exposure")
-        entry = {"port": options.get("port", port), "path": options.get("path", "/"),
-                 "exposure": options.get("exposure", "public")}
+        if roles is None:
+            # Descriptor 1: one path per service site, with its own exposure.
+            check(isinstance(site, str) and SLUG.fullmatch(site) and isinstance(options, dict)
+                  and set(options) <= {"port", "path", "exposure"}, name + ": sites map slugs to port, path and exposure")
+            entry = {"port": options.get("port", port), "path": options.get("path", "/"),
+                     "exposure": options.get("exposure", "public")}
+            check(isinstance(entry["path"], str) and SITE_PATH.fullmatch(entry["path"]),
+                  name + ": site path must start with /")
+            check(entry["exposure"] in EXPOSURES, name + ": site exposure must be public or private")
+            routes = [entry["path"]]
+        else:
+            check(isinstance(site, str) and SLUG.fullmatch(site) and isinstance(options, dict),
+                  name + ": sites map site names to paths and port")
+            check("path" not in options, name + ": site " + site + " lists paths, not path, in descriptor 2")
+            check("exposure" not in options, name + ": site " + site + ": exposure belongs to the top-level site")
+            check(set(options) <= {"port", "paths"}, name + ": site " + site + " takes paths and port")
+            check(site in roles, name + ": site " + site + " is not declared under the top-level sites")
+            routes = options.get("paths", ["/"])
+            check(isinstance(routes, list) and routes, name + ": site " + site + " paths must list at least one path")
+            routes = [route_path(path, name + ": site " + site + " path " + json.dumps(path)) for path in routes]
+            check(len(set(routes)) == len(routes), name + ": site " + site + " lists a path twice")
+            entry = {"port": options.get("port", port), "paths": routes}
         check(type(entry["port"]) is int and 1 <= entry["port"] <= 65535, name + ": site port must be 1-65535")
-        check(isinstance(entry["path"], str) and SITE_PATH.fullmatch(entry["path"]), name + ": site path must start with /")
-        check(entry["exposure"] in EXPOSURES, name + ": site exposure must be public or private")
-        check((site, entry["path"]) not in claimed, name + ": another service already serves site " + site + " at "
-              + entry["path"])
-        claimed.add((site, entry["path"]))
+        for path in routes:
+            check((site, path) not in claimed, name + ": another service (" + str(claimed.get((site, path)))
+                  + ") already serves site " + site + " at " + path)
+            claimed[(site, path)] = name
         sites[site] = entry
     needs = service.get("needs") or []
     check(isinstance(needs, list) and set(needs) <= set(NEEDS), name + ": needs takes postgres, valkey and broker")
@@ -397,8 +481,12 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
     if volumes:
         compose["volumes"] = volumes
     compose_bytes = (json.dumps(compose, indent=2) + "\n").encode()
-    manifest = {"schemaVersion": 1, "product": product, "release": planned["release"], "kind": planned["kind"],
-                "sourceCommit": planned["sourceCommit"], "platform": platform,
+    # Descriptor 2 writes schema 2: `sites` holds the product's host roles and `routes` each service's paths per site.
+    # A descriptor 1 bundle keeps schema 1, byte for byte: `sites` holds each service's sites with one path each.
+    second = descriptor.get("descriptor") == 2
+    served = {name: service["sites"] for name, service in descriptor["services"].items() if service["sites"]}
+    manifest = {"schemaVersion": 2 if second else 1, "product": product, "release": planned["release"],
+                "kind": planned["kind"], "sourceCommit": planned["sourceCommit"], "platform": platform,
                 "rollbackCompatible": rollback_compatible, "composeSha256": hashlib.sha256(compose_bytes).hexdigest(),
                 "images": {name: images[name] for name in descriptor["services"]},
                 "requiredConfiguration": {name: service["settings"]["required"]
@@ -406,8 +494,10 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
                 "versions": {name: {"version": entry["version"], "changedIn": entry["changedIn"]}
                              for name, entry in planned["services"].items()},
                 "ports": {name: service["port"] for name, service in descriptor["services"].items()},
-                "sites": {name: service["sites"] for name, service in descriptor["services"].items() if service["sites"]},
-                "needs": {name: service["needs"] for name, service in descriptor["services"].items() if service["needs"]}}
+                "sites": descriptor["sites"] if second else served}
+    if second:
+        manifest["routes"] = served
+    manifest["needs"] = {name: service["needs"] for name, service in descriptor["services"].items() if service["needs"]}
     # Written only when declared, so a release that declares neither keeps its bundle byte for byte.
     if descriptor.get("dotnetEnvironment"):
         manifest["dotnetEnvironment"] = True
@@ -546,6 +636,14 @@ def load(repo, commit, descriptor_path=None):
     return validate(parse(text))
 
 
+def warned(descriptor):
+    """Prints each warning as a GitHub Actions annotation on stderr, leaving stdout to the action's result. `validate`
+    prints them, once per build: the publish workflow runs it first."""
+    for message in site_warnings(descriptor):
+        print("::warning title=deploy.yml::" + message, file=sys.stderr)
+    return descriptor
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action", choices=["validate", "plan", "build", "ci", "notes"])
@@ -568,7 +666,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.action == "validate":
-            descriptor = validate(parse(Path(args.descriptor or Path(args.repo) / DESCRIPTOR).read_text()))
+            descriptor = warned(validate(parse(Path(args.descriptor or Path(args.repo) / DESCRIPTOR).read_text())))
             print(json.dumps({"product": descriptor["product"], "services": sorted(descriptor["services"])}))
             return 0
         commit = git(args.repo, "rev-parse", "--verify", args.commit + "^{commit}").strip()

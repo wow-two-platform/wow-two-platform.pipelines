@@ -62,7 +62,8 @@ class DescriptorTests(unittest.TestCase):
         cases = (
             (lambda d: d.update(extra=1), "Unknown top-level key"),
             (lambda d: d.update(product="Pilot"), "product must be"),
-            (lambda d: d.update(descriptor=2), "descriptor must be 1"),
+            (lambda d: d.update(descriptor=3), "descriptor must be 1 or 2"),
+            (lambda d: d.update(sites={"app": {}}), "Top-level sites need descriptor 2"),
             (lambda d: d["services"]["api"].pop("health"), "health must be"),
             (lambda d: d["services"]["api"].update(paths=["../outside/**"]), "relative to engineering"),
             (lambda d: d["services"]["api"].update(settings={"file": "appsettings.json"}), "absolute path"),
@@ -134,6 +135,163 @@ class DescriptorTests(unittest.TestCase):
         text = "descriptor: 1\nproduct: pilot\nservices:\n  api:\n    build: {dockerfile: deployment/Dockerfile}\n" \
                "    paths: [codebase/**]\n    health: /health\n"
         self.assertEqual(["api"], list(release.validate(release.parse(text))["services"]))
+
+
+DESCRIPTOR_2 = {
+    "descriptor": 2, "product": "pilot",
+    "sites": {"app": None, "admin": {"exposure": "private", "environments": ["dev"]}},
+    "services": {
+        "api": {"build": {"dockerfile": "deployment/backend.Dockerfile"},
+                "paths": ["codebase/pilot.backend-services/**"], "health": "/health",
+                "sites": {"app": {"paths": ["/api", "/hubs"]}, "admin": {"paths": ["/api"], "port": 8081}}},
+        "edge": {"build": {"dockerfile": "deployment/edge.Dockerfile"},
+                 "paths": ["codebase/pilot.frontend-services/**"], "port": 80, "health": "/healthz",
+                 "sites": {"app": None, "admin": {}}},
+        "worker": {"build": {"dockerfile": "deployment/backend.Dockerfile"},
+                   "paths": ["codebase/pilot.worker/**"], "health": "/health"},
+    },
+}
+
+
+class SitesTests(unittest.TestCase):
+    """Descriptor 2: the product declares its sites; each service lists the paths it serves per site."""
+
+    def test_sites_and_paths_take_their_defaults(self):
+        descriptor = release.validate(copy.deepcopy(DESCRIPTOR_2))
+        self.assertEqual(2, descriptor["descriptor"])
+        self.assertEqual({"app": {"exposure": "public", "primary": True, "environments": ["dev", "prod"]},
+                          "admin": {"exposure": "private", "primary": False, "environments": ["dev"]}},
+                         descriptor["sites"])
+        services = descriptor["services"]
+        self.assertEqual({"app": {"port": 8080, "paths": ["/api", "/hubs"]}, "admin": {"port": 8081, "paths": ["/api"]}},
+                         services["api"]["sites"])
+        self.assertEqual({"app": {"port": 80, "paths": ["/"]}, "admin": {"port": 80, "paths": ["/"]}},
+                         services["edge"]["sites"])
+        self.assertEqual({}, services["worker"]["sites"])
+
+    def test_one_site_may_be_marked_primary_and_environments_keep_their_order(self):
+        declared = copy.deepcopy(DESCRIPTOR_2)
+        declared["sites"] = {"app": {"environments": ["prod", "dev"]}, "admin": {"primary": True}}
+        sites = release.validate(declared)["sites"]
+        self.assertEqual((False, True), (sites["app"]["primary"], sites["admin"]["primary"]))
+        self.assertEqual(["dev", "prod"], sites["app"]["environments"])
+
+    def test_rule_breaks_name_the_rule(self):
+        api = lambda d: d["services"]["api"]
+        cases = (
+            # Exactly one service serves `/` per site: api claims it first, so edge's `/` is the second claim.
+            (lambda d: api(d)["sites"]["app"]["paths"].append("/"),
+             r"edge: another service \(api\) already serves site app at /$"),
+            (lambda d: d["services"]["edge"]["sites"].update(app={"paths": ["/", "/api"]}),
+             r"edge: another service \(api\) already serves site app at /api$"),
+            (lambda d: api(d)["sites"]["app"].update(paths=["/api", "/api"]), "site app lists a path twice"),
+            (lambda d: api(d)["sites"].update(web={}), "site web is not declared under the top-level sites"),
+            (lambda d: d["sites"].update(web={}), "No service serves site web"),
+            (lambda d: api(d)["sites"]["app"].update(path="/api"), "lists paths, not path, in descriptor 2"),
+            (lambda d: api(d)["sites"]["app"].update(exposure="private"), "exposure belongs to the top-level site"),
+            (lambda d: api(d)["sites"]["app"].update(host="app.example.com"), "site app takes paths and port"),
+            (lambda d: api(d)["sites"]["app"].update(paths=[]), "paths must list at least one path"),
+            (lambda d: api(d)["sites"]["app"].update(paths="/api"), "paths must list at least one path"),
+            (lambda d: api(d)["sites"]["app"].update(port=0), "site port must be 1-65535"),
+            (lambda d: d["sites"]["admin"].update(exposure="world"), "site admin: exposure must be public or private"),
+            (lambda d: d["sites"]["admin"].update(environments=["test"]), "environments must list dev, prod or both"),
+            (lambda d: d["sites"]["admin"].update(environments=[]), "environments must list dev, prod or both"),
+            (lambda d: d["sites"]["admin"].update(host="admin.example.com"), "takes exposure, primary and environments"),
+            (lambda d: d["sites"]["admin"].update(primary="yes"), "primary must be true or false"),
+            (lambda d: d["sites"].update(app={"primary": True}, admin={"primary": True}),
+             "Only one site may be primary: app, admin"),
+            (lambda d: d.update(sites=["app"]), "sites must map site names"),
+            (lambda d: d["sites"].update(Admin={}), "Site names must be lowercase slugs"),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                descriptor = copy.deepcopy(DESCRIPTOR_2)
+                mutate(descriptor)
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(descriptor)
+
+    def test_a_bad_path_is_refused(self):
+        for path in ("api", "/api/", "/a//b", "/../x", "/a/./b", "/a b", "/api?x=1", "", "/" + "a" * 200, 7):
+            with self.subTest(path=path):
+                descriptor = copy.deepcopy(DESCRIPTOR_2)
+                descriptor["services"]["api"]["sites"]["app"]["paths"] = [path]
+                with self.assertRaisesRegex(release.Invalid, "must look like / or /api"):
+                    release.validate(descriptor)
+        for path in ("/", "/api", "/api/v2", "/.well-known", "/a~b_c.d-e"):
+            with self.subTest(path=path):
+                descriptor = copy.deepcopy(DESCRIPTOR_2)
+                descriptor["services"]["api"]["sites"]["app"]["paths"] = [path]
+                descriptor["services"]["edge"]["sites"]["app"] = {"paths": ["/web"]} if path == "/" else None
+                self.assertEqual([path], release.validate(descriptor)["services"]["api"]["sites"]["app"]["paths"])
+
+    def test_a_site_without_a_root_path_warns(self):
+        self.assertEqual([], release.site_warnings(release.validate(copy.deepcopy(DESCRIPTOR_2))))
+        declared = copy.deepcopy(DESCRIPTOR_2)
+        declared["services"]["edge"]["sites"]["admin"] = {"paths": ["/ops"]}
+        descriptor = release.validate(declared)
+        self.assertEqual(["site admin has no / path: its host answers 404 outside /api, /ops"],
+                         release.site_warnings(descriptor))
+        with contextlib.redirect_stderr(io.StringIO()) as printed:
+            release.warned(descriptor)
+        self.assertEqual("::warning title=deploy.yml::site admin has no / path: its host answers 404 outside /api, /ops\n",
+                         printed.getvalue())
+        self.assertEqual([], release.site_warnings(release.validate(copy.deepcopy(DESCRIPTOR))))
+
+    def test_a_service_without_sites_needs_no_top_level_sites(self):
+        declared = copy.deepcopy(DESCRIPTOR_2)
+        del declared["sites"]
+        for service in declared["services"].values():
+            service.pop("sites", None)
+        descriptor = release.validate(declared)
+        self.assertEqual({}, descriptor["sites"])
+
+    def test_a_bundle_carries_the_sites_and_each_services_paths(self):
+        descriptor = release.validate(copy.deepcopy(DESCRIPTOR_2))
+        planned = {"release": "v1.0.0", "kind": "release", "sourceCommit": "c" * 40,
+                   "services": {name: {"version": "1.0.0", "changedIn": "v1.0.0"} for name in descriptor["services"]}}
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+        compose_bytes, manifest = release.render(descriptor, planned, images)
+        self.assertEqual(2, manifest["schemaVersion"])
+        self.assertEqual(descriptor["sites"], manifest["sites"])
+        self.assertEqual({"api": {"app": {"port": 8080, "paths": ["/api", "/hubs"]},
+                                  "admin": {"port": 8081, "paths": ["/api"]}},
+                          "edge": {"app": {"port": 80, "paths": ["/"]}, "admin": {"port": 80, "paths": ["/"]}}},
+                         manifest["routes"])
+        self.assertEqual(["sites", "routes", "needs"], list(manifest)[list(manifest).index("sites"):][:3])
+        # Sites never reach Compose: the ingress routes them, so no service publishes a port.
+        self.assertNotIn("ports", json.dumps(json.loads(compose_bytes)))
+
+    def test_a_descriptor_1_bundle_keeps_schema_1(self):
+        descriptor = release.validate(copy.deepcopy(DESCRIPTOR))
+        planned = {"release": "v1.0.0", "kind": "release", "sourceCommit": "c" * 40,
+                   "services": {name: {"version": "1.0.0", "changedIn": "v1.0.0"} for name in descriptor["services"]}}
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+        _, manifest = release.render(descriptor, planned, images)
+        self.assertEqual(1, manifest["schemaVersion"])
+        self.assertNotIn("routes", manifest)
+        self.assertEqual({"api": {"app": {"port": 8080, "path": "/api", "exposure": "public"}},
+                          "edge": {"app": {"port": 80, "path": "/", "exposure": "public"},
+                                   "landing": {"port": 80, "path": "/", "exposure": "public"}}}, manifest["sites"])
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
+    def test_the_documented_example_parses(self):
+        text = """
+descriptor: 2
+product: ocharo-studio
+sites:
+  studio: { primary: true }
+services:
+  studio:
+    build: { dockerfile: deployment/Dockerfile }
+    paths: [codebase/**]
+    health: /health
+    sites:
+      studio: { paths: [/] }
+"""
+        descriptor = release.validate(release.parse(text))
+        self.assertEqual({"studio": {"exposure": "public", "primary": True, "environments": ["dev", "prod"]}},
+                         descriptor["sites"])
+        self.assertEqual({"studio": {"port": 8080, "paths": ["/"]}}, descriptor["services"]["studio"]["sites"])
 
 
 class PlanTests(unittest.TestCase):

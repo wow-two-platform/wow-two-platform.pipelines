@@ -56,6 +56,9 @@ jobs:
   out), then GitHub's generated notes from that release on (merged pull requests and the compare link). Wheelhouse
   shows them before a promotion.
 - Products pin a tag of this repository; a change here ships as a new tag, never by moving one.
+- From `v0.5.0` a descriptor may set `dotnetEnvironment: true` (the runner runs dev as .NET `Development`, prod as
+  `Production`) and declare a `verify` dev check (`service`, `command`, `timeout`); each reaches `release.json` only
+  when declared, so other bundles stay byte for byte the same. An older tag refuses both keys.
 
 ## Running the generator locally
 

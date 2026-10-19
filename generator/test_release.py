@@ -65,6 +65,12 @@ class DescriptorTests(unittest.TestCase):
             (lambda d: d["services"]["api"].update(memory="lots"), "memory must"),
             (lambda d: d["services"]["api"].update(image="ghcr.io/o/api:1"), "without a tag"),
             (lambda d: d["services"]["api"].update(unknown=True), "unknown key"),
+            (lambda d: d.update(dotnetEnvironment="yes"), "dotnetEnvironment must be"),
+            (lambda d: d.update(verify={"service": "worker", "command": ["true"]}), "verify service must"),
+            (lambda d: d.update(verify={"service": "api", "command": "curl"}), "verify command must"),
+            (lambda d: d.update(verify={"service": "api", "command": ["true"], "timeout": "2h"}), "verify timeout must be"),
+            (lambda d: d.update(verify={"service": "api", "command": ["true"], "timeout": 60}), "verify timeout must look"),
+            (lambda d: d.update(verify={"service": "api", "command": ["true"], "image": "x"}), "verify takes"),
         )
         for mutate, message in cases:
             with self.subTest(message=message):
@@ -86,6 +92,18 @@ class DescriptorTests(unittest.TestCase):
         descriptor = release.validate(copy.deepcopy(DESCRIPTOR))
         self.assertEqual(["api", "edge"], release.changed_services(descriptor, [
             "engineering/codebase/pilot.backend-services/Directory.Packages.props"]))
+
+    def test_the_environment_mapping_and_the_dev_check_are_opt_in(self):
+        plain = release.validate(copy.deepcopy(DESCRIPTOR))
+        self.assertEqual((False, None), (plain["dotnetEnvironment"], plain["verify"]))
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared.update(dotnetEnvironment=True, verify={"service": "api", "command": ["dotnet", "Pilot.Verify.dll"]})
+        descriptor = release.validate(declared)
+        self.assertTrue(descriptor["dotnetEnvironment"])
+        self.assertEqual({"service": "api", "command": ["dotnet", "Pilot.Verify.dll"], "timeoutSeconds": 300},
+                         descriptor["verify"])
+        declared["verify"]["timeout"] = "90s"
+        self.assertEqual(90, release.validate(declared)["verify"]["timeoutSeconds"])
 
     @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
     def test_a_yaml_descriptor_parses(self):
@@ -180,6 +198,22 @@ class PlanTests(unittest.TestCase):
         self.assertEqual((["NET_BIND_SERVICE"], ["ALL"]), (edge["cap_add"], edge["cap_drop"]))
         self.assertEqual({"keys": {}}, compose["volumes"])
         self.assertEqual("main", manifest["branch"])
+        # Neither opt-in is declared, so the bundle carries neither key.
+        self.assertNotIn("dotnetEnvironment", written)
+        self.assertNotIn("verify", written)
+
+    def test_a_bundle_carries_the_declared_environment_mapping_and_dev_check(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared.update(dotnetEnvironment=True,
+                        verify={"service": "api", "command": ["sh", "-c", "curl --fail $VERIFY_SERVICE_API/health"],
+                                "timeout": "2m"})
+        descriptor = release.validate(declared)
+        planned = release.plan(descriptor, self.repo, self.first, None)
+        images = {name: "ghcr.io/o/pilot/" + name + "@sha256:" + "c" * 64 for name in descriptor["services"]}
+        _, manifest = release.render(descriptor, planned, images)
+        self.assertTrue(manifest["dotnetEnvironment"])
+        self.assertEqual({"service": "api", "command": ["sh", "-c", "curl --fail $VERIFY_SERVICE_API/health"],
+                          "timeoutSeconds": 120}, manifest["verify"])
 
 
 class VersionTests(unittest.TestCase):

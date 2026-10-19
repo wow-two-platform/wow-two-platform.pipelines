@@ -41,6 +41,9 @@ NEEDS = ("postgres", "valkey", "broker")
 EXPOSURES = ("public", "private")
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
                 "needs", "capabilities"}
+TOP_KEYS = {"descriptor", "product", "platform", "shared", "services", "dotnetEnvironment", "verify"}
+# The end-to-end check after a dev rollout: how long it may run, by default and at most.
+VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
 
 
 class Invalid(ValueError):
@@ -74,7 +77,7 @@ def relative(value, what):
 def validate(descriptor):
     """Checks a parsed descriptor and returns it with every default filled in."""
     check(isinstance(descriptor, dict), "deploy.yml must be a mapping")
-    unknown = set(descriptor) - {"descriptor", "product", "platform", "shared", "services"}
+    unknown = set(descriptor) - TOP_KEYS
     check(not unknown, "Unknown top-level key: " + ", ".join(sorted(map(str, unknown))))
     check(descriptor.get("descriptor") == 1, "descriptor must be 1")
     check(isinstance(descriptor.get("product"), str) and SLUG.fullmatch(descriptor["product"]),
@@ -94,7 +97,34 @@ def validate(descriptor):
         unknown = set(service) - SERVICE_KEYS
         check(not unknown, name + ": unknown key " + ", ".join(sorted(map(str, unknown))))
         result["services"][name] = service_of(name, service, claimed)
+    dotnet = descriptor.get("dotnetEnvironment", False)
+    check(type(dotnet) is bool, "dotnetEnvironment must be true or false")
+    result["dotnetEnvironment"] = dotnet
+    result["verify"] = verify_of(descriptor.get("verify"), result["services"])
     return result
+
+
+def seconds(value, what):
+    """A duration like 30s, 5m or 1h, in seconds."""
+    check(isinstance(value, str) and DURATION.fullmatch(value), what + " must look like 30s, 5m or 1h")
+    return int(value[:-1]) * {"s": 1, "m": 60, "h": 3600}[value[-1]]
+
+
+def verify_of(verify, services):
+    """The end-to-end check the runner runs after a dev rollout: a command in a one-off container from one service's
+    release image, bounded by a timeout. None when the descriptor declares none."""
+    if verify is None:
+        return None
+    check(isinstance(verify, dict) and set(verify) <= {"service", "command", "timeout"},
+          "verify takes service, command and timeout")
+    check(isinstance(verify.get("service"), str) and verify["service"] in services, "verify service must name a service")
+    command = verify.get("command")
+    check(isinstance(command, list) and 0 < len(command) <= 32
+          and all(isinstance(part, str) and part and len(part) <= 1000 and "\0" not in part for part in command),
+          "verify command must list the program and its arguments")
+    timeout = seconds(verify.get("timeout", str(VERIFY_TIMEOUT) + "s"), "verify timeout")
+    check(10 <= timeout <= VERIFY_TIMEOUT_LIMIT, "verify timeout must be 10s-30m")
+    return {"service": verify["service"], "command": command, "timeoutSeconds": timeout}
 
 
 def service_of(name, service, claimed):
@@ -350,6 +380,11 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
                 "ports": {name: service["port"] for name, service in descriptor["services"].items()},
                 "sites": {name: service["sites"] for name, service in descriptor["services"].items() if service["sites"]},
                 "needs": {name: service["needs"] for name, service in descriptor["services"].items() if service["needs"]}}
+    # Written only when declared, so a release that declares neither keeps its bundle byte for byte.
+    if descriptor.get("dotnetEnvironment"):
+        manifest["dotnetEnvironment"] = True
+    if descriptor.get("verify"):
+        manifest["verify"] = descriptor["verify"]
     if branch:
         manifest["branch"] = branch
     if identity:

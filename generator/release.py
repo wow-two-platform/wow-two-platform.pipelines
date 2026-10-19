@@ -5,7 +5,8 @@ A product version is X.Y.Z: X.Y is the newest engineering/planning/version-track
 after the highest vX.Y.* tag. A build of `main` is a release vX.Y.Z; a build of `dev` replaces that branch's previous
 build; any other branch, or a dispatched commit, builds a candidate. Only services whose paths changed since
 the base release rebuild; the rest keep the base release's image and version, so each service carries the version in
-which it last changed. Descriptor 2 declares the product's sites at the top and the paths each service serves per site;
+which it last changed. A base whose source commit is not in the repository's history (an author rewrite removed it) is
+not used: every service rebuilds and the build warns. Descriptor 2 declares the product's sites at the top and the paths each service serves per site;
 descriptor 1 (one path per service site) still reads and keeps its bundles byte for byte.
 Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md.
 Requires Python 3.9+, Git and, for `build` / `ci`, Docker with Buildx; the descriptor parser needs PyYAML.
@@ -347,20 +348,72 @@ def git(repo, *arguments):
     return result.stdout
 
 
+# The longest a fetch of a missing base commit may take before the base counts as lost.
+FETCH_TIMEOUT = 300
+
+
+def git_ok(repo, *arguments, timeout=None):
+    """Whether a git command succeeds; a command that outlives `timeout` seconds fails. Never asks for credentials."""
+    try:
+        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, timeout=timeout,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def base_commit_known(repo, source, commit):
+    """Whether the base release's source commit is in this repository's history, related to `commit`.
+
+    A commit this clone lacks is fetched from origin by SHA, and a shallow clone is deepened before the base counts as
+    unrelated, so a shallow checkout still finds a reachable base. A commit an author rewrite removed from the history
+    is not found, and one that shares no history with `commit` is not used. It need not be an ancestor: a candidate on
+    a branch behind `main` diffs against the newest release all the same."""
+    if not (isinstance(source, str) and SHA.fullmatch(source)):
+        return False
+    present = source + "^{commit}"
+    if not git_ok(repo, "cat-file", "-e", present):
+        if not (git_ok(repo, "fetch", "--quiet", "--no-tags", "origin", source, timeout=FETCH_TIMEOUT)
+                and git_ok(repo, "cat-file", "-e", present)):
+            return False
+    if git_ok(repo, "merge-base", source, commit):
+        return True
+    shallow = subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"],
+                             capture_output=True, text=True).stdout.strip() == "true"
+    return (shallow and git_ok(repo, "fetch", "--quiet", "--no-tags", "--unshallow", "origin", timeout=FETCH_TIMEOUT)
+            and git_ok(repo, "merge-base", source, commit))
+
+
+def base_changes(repo, source, commit):
+    """The paths that differ between the base release's source commit and `commit`; None when the base is lost, that
+    is when its commit is not in this history or the diff fails."""
+    if not base_commit_known(repo, source, commit):
+        return None
+    try:
+        return git(repo, "diff", "--name-only", source, commit).splitlines()
+    except Invalid:
+        return None
+
+
 def plan(descriptor, repo, commit, base=None, tag=None, version=None):
     """Which services to build and every service's version; `base` is the previous release's manifest.
 
     `version` is the build's own version (`build_identity`); without it a release takes its tag's and a candidate
-    `<base version>+<commit>`."""
+    `<base version>+<commit>`. A base whose source commit is lost (`base_changes`) is not used: every service builds,
+    carries this build's version, and the plan holds a `warning` saying so."""
     check(SHA.fullmatch(commit), "Resolve the commit to its full SHA first")
     check(tag is None or TAG.fullmatch(tag), "A release tag looks like v1.2.3")
     short = commit[:7]
-    descriptor_changed = False
-    if base is None:
+    descriptor_changed, warning, carried = False, None, base
+    if base is not None:
+        check(base.get("product") == descriptor["product"], "The base release belongs to another product")
+        paths = base_changes(repo, base.get("sourceCommit"), commit)
+        if paths is None:
+            carried = None
+            warning = ("Base " + str(base["release"]) + "'s source commit (" + str(base.get("sourceCommit"))[:7]
+                       + ") is not in this history; every service was rebuilt.")
+    if carried is None:
         rebuild = list(descriptor["services"])
     else:
-        check(base.get("product") == descriptor["product"], "The base release belongs to another product")
-        paths = git(repo, "diff", "--name-only", base["sourceCommit"], commit).splitlines()
         rebuild = changed_services(descriptor, paths)
         descriptor_changed = DESCRIPTOR in paths
         # A service the base release never shipped has no image to keep.
@@ -377,9 +430,18 @@ def plan(descriptor, repo, commit, base=None, tag=None, version=None):
                                                                "changedIn": base["release"]}
             services[name] = {"build": False, "version": kept["version"], "changedIn": kept["changedIn"],
                               "image": base["images"][name]}
-    return {"product": descriptor["product"], "release": label, "kind": "release" if tag else "candidate",
-            "sourceCommit": commit, "base": base["release"] if base else None, "services": services,
-            "descriptorChanged": descriptor_changed}
+    planned = {"product": descriptor["product"], "release": label, "kind": "release" if tag else "candidate",
+               "sourceCommit": commit, "base": carried["release"] if carried else None, "services": services,
+               "descriptorChanged": descriptor_changed}
+    if warning:
+        planned["warning"] = warning
+    return planned
+
+
+def announce(planned):
+    """Prints the plan's warning, if any, as a GitHub Actions annotation: a line in the job log."""
+    if planned.get("warning"):
+        print("::warning title=release base::" + planned["warning"], file=sys.stderr)
 
 
 # --------------------------------------------------------------------- version
@@ -605,10 +667,11 @@ def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=
 NOTES_LIMIT = 100
 
 
-def release_notes(repo, commit, previous=None):
+def release_notes(repo, commit, previous=None, warning=None):
     """The changelog a main release carries above GitHub's generated notes (pull requests and the compare link): the
     commits since the previous release, newest first and one line each, 100 at most; merge commits are left out. A
-    first release lists its history up to the limit. Wheelhouse shows these bodies before a promotion."""
+    first release lists its history up to the limit. A `warning` (a lost base release) leads the notes. Wheelhouse
+    shows these bodies before a promotion."""
     revisions = previous + ".." + commit if previous else commit
     if previous:
         check(subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", previous + "^{commit}"],
@@ -617,6 +680,8 @@ def release_notes(repo, commit, previous=None):
                                   revisions).splitlines() if line]
     total = int(git(repo, "rev-list", "--count", "--no-merges", revisions).strip() or 0)
     notes = ["Built by wow-two-platform.pipelines from " + commit + ".", ""]
+    if warning:
+        notes += ["**Warning:** " + warning, ""]
     notes.append("## Commits since " + previous if previous else "## Commits")
     notes.append("")
     for line in lines:
@@ -663,6 +728,7 @@ def main():
     parser.add_argument("--output", help="bundle folder to write")
     parser.add_argument("--archive", help="also write a .tar.gz of the bundle for import")
     parser.add_argument("--previous", help="notes: the previous release's tag; the notes list the commits since it")
+    parser.add_argument("--warning", help="notes: a line the notes lead with, the build's base warning")
     args = parser.parse_args()
     try:
         if args.action == "validate":
@@ -671,7 +737,7 @@ def main():
             return 0
         commit = git(args.repo, "rev-parse", "--verify", args.commit + "^{commit}").strip()
         if args.action == "notes":
-            sys.stdout.write(release_notes(args.repo, commit, args.previous or None))
+            sys.stdout.write(release_notes(args.repo, commit, args.previous or None, args.warning or None))
             return 0
         descriptor = load(args.repo, commit, args.descriptor)
         if args.platform:
@@ -680,6 +746,7 @@ def main():
         if args.action == "ci":
             return ci(args, commit, descriptor, base)
         planned = plan(descriptor, args.repo, commit, base, args.tag)
+        announce(planned)
         if args.action == "plan":
             print(json.dumps(planned, indent=2))
             return 0
@@ -700,12 +767,16 @@ def main():
 def ci(args, commit, descriptor, base):
     """The shared workflow's step: version the build, build and tag the changed services, write the bundle.
 
-    Writes `status`, `kind`, `channel`, `version`, `release` and `archive` to `$GITHUB_OUTPUT` when it is set."""
+    Writes `status`, `kind`, `channel`, `version`, `release` and `archive` to `$GITHUB_OUTPUT` when it is set, and
+    `warning` too when the base release is lost (every service rebuilt)."""
     check(args.registry and args.output, "ci needs --registry and --output")
     identity = build_identity(args.repo, commit, args.branch or None, args.main)
     release_tag = identity["release"] if identity["kind"] == "release" else None
     planned = plan(descriptor, args.repo, commit, base, release_tag, identity["version"])
     result = {key: identity[key] for key in ("kind", "channel", "version", "release")}
+    announce(planned)
+    if planned.get("warning"):
+        result["warning"] = planned["warning"]
     # A push that changes no service and no descriptor publishes nothing; a dispatched commit always builds.
     if args.branch and nothing_to_publish(planned):
         result.update(status="skipped", archive="")
@@ -724,8 +795,9 @@ def ci(args, commit, descriptor, base):
     outputs = os.environ.get("GITHUB_OUTPUT")
     if outputs:
         with open(outputs, "a") as stream:
-            for key in ("status", "kind", "channel", "version", "release", "archive"):
-                stream.write(key + "=" + str(result[key]) + "\n")
+            for key in ("status", "kind", "channel", "version", "release", "archive", "warning"):
+                if key in result:
+                    stream.write(key + "=" + str(result[key]) + "\n")
     print(json.dumps(result))
     return 0
 

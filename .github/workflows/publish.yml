@@ -4,6 +4,8 @@
 #                   whose notes list the commits since the previous release above GitHub's generated notes
 #   other branch  → candidate X.Y.(Z+1)-<branch>.<n>: images tagged sha-<commit>, bundle-<commit> artifact
 #   commit input  → candidate X.Y.(Z+1)-g<commit> for a commit that has no build (Wheelhouse's Build action)
+# A previous release whose source commit is not in the checked-out history (an author rewrite removed it) is not used
+# as the base: every service rebuilds, and the job log and the release notes say so.
 # Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md § Builds and versions.
 name: publish
 
@@ -90,6 +92,9 @@ jobs:
         # The body: the commits since the previous release (release.py notes), then GitHub's generated notes — the
         # pull requests merged since it and the compare link. Wheelhouse shows these bodies before a promotion.
         if: steps.build.outputs.status == 'built' && steps.build.outputs.kind == 'release'
+        env:
+          # Set when the base release's source commit is not in this history and every service was rebuilt.
+          BASE_WARNING: ${{ steps.build.outputs.warning }}
         run: |
           set -euo pipefail
           notes=(notes --repo . --commit "$COMMIT")
@@ -97,6 +102,9 @@ jobs:
           if [ -n "${PREVIOUS_RELEASE:-}" ]; then
             notes+=(--previous "$PREVIOUS_RELEASE")
             start=(--notes-start-tag "$PREVIOUS_RELEASE")
+          fi
+          if [ -n "${BASE_WARNING:-}" ]; then
+            notes+=(--warning "$BASE_WARNING")
           fi
           python3 .pipelines/generator/release.py "${notes[@]}" > "$RUNNER_TEMP/release-notes.md"
           gh release create "${{ steps.build.outputs.release }}" "${{ steps.build.outputs.archive }}" \

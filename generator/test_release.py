@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -357,6 +358,109 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(release.Invalid, "another product"):
             release.plan(self.descriptor, self.repo, self.first, {**self.base, "product": "other"})
 
+    def assert_rebuilt_without_the_base(self, planned, label, version, release_name="v1.0.0"):
+        self.assertEqual({"api", "edge"}, set(planned["services"]))
+        for name, entry in planned["services"].items():
+            with self.subTest(service=name):
+                self.assertEqual({"build": True, "version": version, "changedIn": label}, entry)
+        self.assertIsNone(planned["base"])
+        self.assertFalse(planned["descriptorChanged"])
+        self.assertEqual("Base " + release_name + "'s source commit (" + self.lost[:7]
+                         + ") is not in this history; every service was rebuilt.", planned["warning"])
+        self.assertFalse(release.nothing_to_publish(planned))
+
+    lost = "1bcb4722ec27bbe4dff2f955f2ea50572f0af591"
+
+    def test_a_base_commit_missing_from_the_history_rebuilds_every_service_with_a_warning(self):
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "two")
+        second = self.commit("edge change")
+        lost = {**self.base, "sourceCommit": self.lost}
+        released = release.plan(self.descriptor, self.repo, second, lost, "v1.1.0")
+        self.assert_rebuilt_without_the_base(released, "v1.1.0", "1.1.0")
+        self.assertEqual("release", released["kind"])
+        candidate = release.plan(self.descriptor, self.repo, second, lost)
+        self.assert_rebuilt_without_the_base(candidate, "sha-" + second[:7], "1.0.0+" + second[:7])
+        built = release.plan(self.descriptor, self.repo, second, lost, "v1.1.0", "1.1.0")
+        self.assertEqual(released, built)
+
+    def test_a_base_without_a_usable_source_commit_counts_as_lost(self):
+        for source in (None, "", "main", "--output=x", "1bcb472"):
+            with self.subTest(source=source):
+                base = {key: value for key, value in self.base.items() if key != "sourceCommit"}
+                if source is not None:
+                    base["sourceCommit"] = source
+                planned = release.plan(self.descriptor, self.repo, self.first, base, "v1.1.0")
+                self.assertTrue(all(entry["build"] for entry in planned["services"].values()))
+                self.assertIn("every service was rebuilt", planned["warning"])
+
+    def test_a_base_commit_that_shares_no_history_counts_as_lost(self):
+        tree = git(self.repo, "rev-parse", self.first + "^{tree}")
+        twin = git(self.repo, "commit-tree", tree, "-m", "the same tree under another history")
+        self.lost = twin
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "two")
+        second = self.commit("edge change")
+        planned = release.plan(self.descriptor, self.repo, second, {**self.base, "sourceCommit": twin}, "v1.1.0")
+        self.assert_rebuilt_without_the_base(planned, "v1.1.0", "1.1.0")
+
+    def test_a_failing_diff_counts_as_lost(self):
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "two")
+        second = self.commit("edge change")
+        with unittest.mock.patch.object(release, "base_commit_known", return_value=True):
+            planned = release.plan(self.descriptor, self.repo, second, {**self.base, "sourceCommit": self.lost}, "v1.1.0")
+        self.assert_rebuilt_without_the_base(planned, "v1.1.0", "1.1.0")
+
+    def test_a_base_in_the_history_plans_as_before_without_a_warning(self):
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "two")
+        second = self.commit("edge change")
+        planned = release.plan(self.descriptor, self.repo, second, self.base, "v1.1.0")
+        self.assertNotIn("warning", planned)
+        self.assertEqual({"product": "pilot", "release": "v1.1.0", "kind": "release", "sourceCommit": second,
+                          "base": "v1.0.0", "descriptorChanged": False,
+                          "services": {"api": {"build": False, "version": "1.0.0", "changedIn": "v1.0.0",
+                                               "image": "ghcr.io/o/pilot/api" + DIGEST},
+                                       "edge": {"build": True, "version": "1.1.0", "changedIn": "v1.1.0"}}}, planned)
+
+    def test_a_base_on_another_branch_still_diffs_when_it_shares_history(self):
+        # A candidate on a branch behind main: the newest release is not its ancestor, but the trees still compare.
+        git(self.repo, "checkout", "-q", "-b", "side")
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "side")
+        side = self.commit("side change")
+        git(self.repo, "checkout", "-q", "main")
+        self.write("engineering/codebase/pilot.backend-services/Pilot.Api/Program.cs", "main")
+        head = self.commit("api change")
+        planned = release.plan(self.descriptor, self.repo, head, {**self.base, "sourceCommit": side})
+        self.assertNotIn("warning", planned)
+        self.assertEqual({"api": True, "edge": True}, {name: entry["build"] for name, entry in planned["services"].items()})
+        unchanged = release.plan(self.descriptor, self.repo, self.first, {**self.base, "sourceCommit": self.first})
+        self.assertEqual({"api": False, "edge": False}, {name: entry["build"] for name, entry in unchanged["services"].items()})
+
+    def test_a_shallow_clone_still_finds_a_reachable_base_commit(self):
+        git(self.repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "two")
+        self.commit("edge change")
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "three")
+        head = self.commit("edge change again")
+        clone = Path(self.temporary.name + "-shallow")
+        self.addCleanup(shutil.rmtree, clone, True)
+        git(self.repo, "clone", "-q", "--depth", "1", self.repo.as_uri(), str(clone))
+        self.assertEqual("true", git(clone, "rev-parse", "--is-shallow-repository"))
+        self.assertNotEqual(0, subprocess.run(["git", "-C", str(clone), "cat-file", "-e", self.first + "^{commit}"],
+                                              capture_output=True).returncode)
+        planned = release.plan(self.descriptor, clone, head, self.base, "v1.1.0")
+        self.assertNotIn("warning", planned)
+        self.assertEqual({"api": False, "edge": True}, {name: entry["build"] for name, entry in planned["services"].items()})
+        self.assertEqual("v1.0.0", planned["base"])
+        self.assertEqual(self.first, git(clone, "rev-parse", self.first))
+
+    def test_a_shallow_clone_without_the_base_commit_anywhere_counts_as_lost(self):
+        self.write("engineering/codebase/pilot.frontend-services/app.ts", "two")
+        head = self.commit("edge change")
+        clone = Path(self.temporary.name + "-shallow")
+        self.addCleanup(shutil.rmtree, clone, True)
+        git(self.repo, "clone", "-q", "--depth", "1", self.repo.as_uri(), str(clone))
+        planned = release.plan(self.descriptor, clone, head, {**self.base, "sourceCommit": self.lost}, "v1.1.0")
+        self.assert_rebuilt_without_the_base(planned, "v1.1.0", "1.1.0")
+
     def test_the_rendered_bundle_pins_every_image_and_its_compose_hash(self):
         self.write("engineering/codebase/pilot.backend-services/Pilot.Api/Program.cs", "two")
         second = self.commit("api change")
@@ -561,6 +665,18 @@ class NotesTests(unittest.TestCase):
                          [line.rsplit(" (", 1)[0] for line in notes[4:7]])
         self.assertEqual("- …and 2 more", notes[7])
 
+    def test_a_lost_base_warning_leads_the_notes_and_no_warning_leaves_them_unchanged(self):
+        self.commit("feat: first page")
+        git(self.repo, "tag", "v0.1.0")
+        head = self.commit("feat: added billing")
+        plain = release.release_notes(self.repo, head, "v0.1.0")
+        self.assertEqual(plain, release.release_notes(self.repo, head, "v0.1.0", None))
+        warning = "Base v0.1.0's source commit (1bcb472) is not in this history; every service was rebuilt."
+        warned = release.release_notes(self.repo, head, "v0.1.0", warning).splitlines()
+        self.assertEqual(["Built by wow-two-platform.pipelines from " + head + ".", "", "**Warning:** " + warning, "",
+                          "## Commits since v0.1.0"], warned[:5])
+        self.assertEqual(plain.splitlines()[3:], warned[5:])
+
     def test_no_commit_since_the_previous_release_says_so_and_an_unknown_tag_is_refused(self):
         head = self.commit("feat: only")
         git(self.repo, "tag", "v0.1.0")
@@ -581,6 +697,12 @@ class NotesTests(unittest.TestCase):
                      "--generate-notes", "--notes-start-tag \"$PREVIOUS_RELEASE\""):
             self.assertIn(part, publish["run"])
         self.assertNotIn("--notes \"", publish["run"])
+        # The lost-base warning travels build output -> environment -> `notes --warning`, never into the shell text.
+        self.assertEqual("${{ steps.build.outputs.warning }}", publish["env"]["BASE_WARNING"])
+        self.assertIn('--warning "$BASE_WARNING"', publish["run"])
+        self.assertNotIn("outputs.warning", publish["run"])
+        self.assertEqual(0, next(step for step in steps if step.get("uses", "").startswith("actions/checkout"))
+                         ["with"]["fetch-depth"])
 
 
 class CiTests(unittest.TestCase):
@@ -627,9 +749,10 @@ class CiTests(unittest.TestCase):
     def run_ci(self, branch, base=None):
         arguments = argparse.Namespace(repo=str(self.repo), branch=branch, main="main", registry="ghcr.io/o/pilot",
                                        output="bundle", rollback_compatible=False)
-        with contextlib.redirect_stdout(io.StringIO()) as printed:
+        with contextlib.redirect_stdout(io.StringIO()) as printed, contextlib.redirect_stderr(io.StringIO()) as logged:
             release.ci(arguments, self.commit, self.descriptor, base)
-        return json.loads(printed.getvalue()), dict(line.split("=", 1) for line in self.outputs.read_text().split())
+        self.logged = logged.getvalue()
+        return json.loads(printed.getvalue()), dict(line.split("=", 1) for line in self.outputs.read_text().splitlines())
 
     def test_main_releases_tags_every_image_latest_and_writes_the_archive(self):
         result, outputs = self.run_ci("main")
@@ -647,6 +770,37 @@ class CiTests(unittest.TestCase):
                                                                 outputs.get("archive", "")))
         self.assertEqual({"sha-" + self.commit[:7]}, {tag for _, tag, _, _ in self.built})
         self.assertEqual(set(), {tag for _, tag in self.moved})
+
+    def test_a_lost_base_rebuilds_every_service_and_warns_in_the_log_and_the_outputs(self):
+        base = {"product": "pilot", "release": "v0.3.0", "sourceCommit": "1bcb4722ec27bbe4dff2f955f2ea50572f0af591",
+                "images": {"api": "ghcr.io/o/pilot/api" + DIGEST, "edge": "ghcr.io/o/pilot/edge" + DIGEST},
+                "versions": {"api": {"version": "0.3.0", "changedIn": "v0.3.0"},
+                             "edge": {"version": "0.2.0", "changedIn": "v0.2.0"}}}
+        result, outputs = self.run_ci("main", base)
+        warning = "Base v0.3.0's source commit (1bcb472) is not in this history; every service was rebuilt."
+        self.assertEqual((warning, "built", "v0.4.0"), (outputs["warning"], outputs["status"], outputs["release"]))
+        self.assertEqual(warning, result["warning"])
+        self.assertIn("::warning title=release base::" + warning + "\n", self.logged)
+        self.assertEqual({"api", "edge"}, {name for name, _, _, _ in self.built})
+        manifest = json.loads(Path(self.temporary.name, "bundle", "release.json").read_text())
+        self.assertEqual({"api": {"version": "0.4.0", "changedIn": "v0.4.0"},
+                          "edge": {"version": "0.4.0", "changedIn": "v0.4.0"}}, manifest["versions"])
+        self.assertTrue(all(DIGEST not in image for image in manifest["images"].values()))
+
+    def test_a_lost_base_still_builds_a_branch_push_a_known_base_would_skip(self):
+        base = {"product": "pilot", "release": "v0.3.0", "sourceCommit": "1" * 40,
+                "images": {"api": "ghcr.io/o/pilot/api" + DIGEST, "edge": "ghcr.io/o/pilot/edge" + DIGEST}}
+        result, outputs = self.run_ci("dev", base)
+        self.assertEqual("built", outputs["status"])
+        self.assertEqual({"api", "edge"}, {name for name, _, _, _ in self.built})
+
+    def test_a_known_base_adds_no_warning_to_the_log_the_outputs_or_the_result(self):
+        base = {"product": "pilot", "release": "v0.4.0", "sourceCommit": self.commit,
+                "images": {"api": "ghcr.io/o/pilot/api" + DIGEST, "edge": "ghcr.io/o/pilot/edge" + DIGEST}}
+        result, outputs = self.run_ci("main", base)
+        self.assertEqual({"status", "kind", "channel", "version", "release", "archive"}, set(outputs))
+        self.assertNotIn("warning", result)
+        self.assertEqual("", self.logged)
 
     def test_a_push_that_changes_nothing_is_skipped(self):
         base = {"product": "pilot", "release": "v0.4.0", "sourceCommit": self.commit,

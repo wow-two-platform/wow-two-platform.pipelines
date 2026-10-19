@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   publish:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.8.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.8.1
     with:
       commit: ${{ inputs.commit }}
 ```
@@ -75,6 +75,13 @@ jobs:
   `release.json` schema 2 (`sites` the roles, `routes` each service's ports and paths); Wheelhouse's runner routes it
   by host and path, longest prefix first. Descriptor 1 is deprecated and keeps its schema 1 bundles byte for byte;
   an older tag refuses descriptor 2.
+- From `v0.8.1` a base release whose `sourceCommit` is not in the repository's history (an author rewrite removed it)
+  no longer fails the build with `git diff failed: fatal: bad object`. The checkout is full (`fetch-depth: 0`) and a
+  shallow one is deepened; a commit still missing, sharing no history with the build, or failing the diff is lost. A
+  lost base is not used: every service rebuilds, carries the build's version and `changedIn` the new release, and no
+  image comes from the base. The job log gets a `::warning` annotation and the release notes lead with
+  `**Warning:** Base vX.Y.Z's source commit (<sha>) is not in this history; every service was rebuilt.` A base that
+  is in the history plans and bundles byte for byte as before.
 
 ## Running the generator locally
 

@@ -39,6 +39,9 @@ SITE_PATH = re.compile(r"/(?:[A-Za-z0-9._~-]+/)*(?:[A-Za-z0-9._~-]+)?")
 PLATFORMS = ("linux/amd64", "linux/arm64")
 NEEDS = ("postgres", "valkey", "broker")
 EXPOSURES = ("public", "private")
+# Where a service's private settings file mounts unless its descriptor names a path; the .NET host reads it after
+# appsettings.{Environment}.json. Bundles before v0.7.0 mounted /app/appsettings.Local.json, now a machine's own file.
+SETTINGS_FILE = "/app/appsettings.Target.json"
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
                 "needs", "capabilities", "dependsOn"}
 TOP_KEYS = {"descriptor", "product", "platform", "shared", "services", "dotnetEnvironment", "verify"}
@@ -173,7 +176,7 @@ def service_of(name, service, claimed):
     settings = service.get("settings")
     if settings is not None:
         check(isinstance(settings, dict) and set(settings) <= {"file", "required"}, name + ": settings takes file and required")
-        file = settings.get("file", "/app/appsettings.Local.json")
+        file = settings.get("file", SETTINGS_FILE)
         required = settings.get("required") or []
         check(isinstance(file, str) and file.startswith("/"), name + ": settings file must be an absolute path")
         check(isinstance(required, list) and all(isinstance(key, str) and key for key in required),

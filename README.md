@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   publish:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.6.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/publish.yml@v0.7.0
     with:
       commit: ${{ inputs.commit }}
 ```
@@ -64,6 +64,10 @@ jobs:
   `depends_on: { <service>: { condition: service_healthy } }`, never `restart: true`, so Wheelhouse starts a release in
   dependency order and a dependency's update never restarts its dependents. A bundle that declares none is byte for
   byte the same; an older tag refuses the key.
+- From `v0.7.0` a service's settings file mounts at `/app/appsettings.Target.json` unless `settings.file` names
+  another path; older tags mount it at `/app/appsettings.Local.json`, which is now a developer machine's own file. The be
+  sdk reads the target's file (`AddSettingsFiles`, called by `AddApiDefaults`) and, for one release window, a legacy
+  `appsettings.Local.json` on a deployed host without it. Move the pin together with that be sdk.
 
 ## Running the generator locally
 

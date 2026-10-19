@@ -47,10 +47,16 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(("linux/amd64", 8080, "512m", "30s", "codebase"),
                          (descriptor["platform"], api["port"], api["memory"], api["stopGrace"], api["build"]["context"]))
         self.assertEqual(["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health"], api["health"])
-        self.assertEqual({"file": "/app/appsettings.Local.json", "required": ["Database:Connection"]}, api["settings"])
+        self.assertEqual({"file": "/app/appsettings.Target.json", "required": ["Database:Connection"]}, api["settings"])
         self.assertEqual({"app": {"port": 80, "path": "/", "exposure": "public"},
                           "landing": {"port": 80, "path": "/", "exposure": "public"}}, edge["sites"])
         self.assertEqual(["CMD", "wget", "-q", "-O-", "http://localhost/healthz"], edge["health"])
+
+    def test_an_explicit_settings_file_keeps_its_path(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["file"] = "/app/appsettings.Local.json"
+        api = release.validate(declared)["services"]["api"]
+        self.assertEqual({"file": "/app/appsettings.Local.json", "required": ["Database:Connection"]}, api["settings"])
 
     def test_rule_breaks_name_the_rule(self):
         cases = (
@@ -211,7 +217,8 @@ class PlanTests(unittest.TestCase):
         compose = json.loads(compose_bytes)
         api, edge = compose["services"]["api"], compose["services"]["edge"]
         self.assertEqual(["pilot-${DEPLOY_ENVIRONMENT}-api"], api["networks"]["platform"]["aliases"])
-        self.assertEqual("${API_SETTINGS:?Set API_SETTINGS}", api["volumes"][0]["source"])
+        self.assertEqual({"type": "bind", "source": "${API_SETTINGS:?Set API_SETTINGS}",
+                          "target": "/app/appsettings.Target.json", "read_only": True}, api["volumes"][0])
         self.assertEqual({"type": "volume", "source": "keys", "target": "/data/keys"}, api["volumes"][1])
         self.assertEqual((["NET_BIND_SERVICE"], ["ALL"]), (edge["cap_add"], edge["cap_drop"]))
         self.assertEqual({"keys": {}}, compose["volumes"])

@@ -56,16 +56,21 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
       # The cache flags publish passes (release.py build_image, cache "gha") on a throwaway image: export, then import.
+      # Buildx 4 prints no CACHED line for a layer it pulls from the remote cache, so a reused layer is told by its
+      # content: the stamp is a fresh uuid per execution and survives the second build only through the cache.
       - name: Build twice through the gha cache
         run: |
           set -euo pipefail
           context=$(mktemp -d)
-          printf 'FROM busybox:1.37\nRUN echo "%s" > /stamp\n' "$GITHUB_RUN_ID" > "$context/Dockerfile"
+          printf 'FROM busybox:1.37\nRUN echo "%s" > /run\nRUN cat /proc/sys/kernel/random/uuid > /stamp\n' "$GITHUB_RUN_ID" > "$context/Dockerfile"
           flags=$(python3 -c 'import sys; sys.path.insert(0, "generator"); import release; print(" ".join(release.cache_flags("gha", "smoke")))')
           # shellcheck disable=SC2086
           docker buildx build $flags --load -t cache-smoke "$context"
-          # Empty the builder, so the second build can only reuse its layer through the gha cache.
+          first=$(docker run --rm cache-smoke cat /stamp)
+          # Empty the builder, so the second build can only reuse its layers through the gha cache.
           docker buildx prune --all --force
           # shellcheck disable=SC2086
-          docker buildx build $flags --load -t cache-smoke "$context" 2>&1 | tee "$RUNNER_TEMP/second.log"
-          grep -q 'CACHED' "$RUNNER_TEMP/second.log"
+          docker buildx build $flags --load -t cache-smoke "$context"
+          second=$(docker run --rm cache-smoke cat /stamp)
+          echo "first=$first second=$second"
+          test "$first" = "$second"

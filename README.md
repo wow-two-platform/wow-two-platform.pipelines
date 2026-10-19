@@ -81,11 +81,13 @@ a list of lines, run with `bash -eo pipefail`.
 
 | Input | Keys |
 |---|---|
-| `backends` (list) | `name`, `run`; `dir` (`.`), `dotnet` (a `global.json` or an SDK version), `node` (an `.nvmrc`; adds pnpm), `python`, `pip` (install arguments), `pip-cache` (requirements glob), `lfs`, `history` (full clone), `pipelines` (the generator at this tag in `$PIPELINES_DIR`), `paths`, `timeout` (30) |
+| `backends` (list) | `name`, `run`; `dir` (`.`), `dotnet` (a `global.json` or an SDK version), `node` (an `.nvmrc`; adds pnpm), `pnpm-lock` (beside the `.nvmrc`), `python`, `pip` (install arguments), `pip-cache` (requirements glob), `lfs`, `history` (full clone), `pipelines` (the generator at this tag in `$PIPELINES_DIR`), `paths`, `timeout` (30) |
 | `frontends` (list) | `name`, `dir`; `scripts` (`lint typecheck test build`), `node` (`<dir>/.nvmrc`), `lfs`, `paths`, `timeout` (20) |
 | `browser` (object) | `name`, `dir`, `run` (gets `$SHARD`, `$SHARDS`); `shards` (1), `setup`, `dotnet`, `node`, `lfs`, `artifact` (kept on failure), `paths`, `timeout` (30) |
 | `docs` (list) | extra globs that never build |
 
+- `lfs` is `true` (every LFS file) or `git lfs pull --include` patterns, such as `engineering/codebase/**`; without it
+  a check fetches none.
 - Every .NET job restores a NuGet cache keyed on its lockfiles and project files; every Node job a pnpm store cache.
 - The `gate` job (`ci`'s one result) passes when every selected check passed; it is skipped only on a superseded push.
 - Every job has a timeout; every action is pinned to a commit.

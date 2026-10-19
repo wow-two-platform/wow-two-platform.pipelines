@@ -94,7 +94,7 @@ class CheckTests(unittest.TestCase):
     def test_entries_fill_their_defaults(self):
         backends, frontends, shards = ci_plan.checks(BACKENDS, FRONTENDS, BROWSER)
         backend, runner = backends
-        self.assertEqual((".", 30, 1, False, "global.json", "", True), (
+        self.assertEqual((".", 30, 1, "", "global.json", "", True), (
             backend["dir"], backend["timeout"], backend["fetch-depth"], backend["lfs"], backend["dotnet-json"],
             backend["dotnet-version"], backend["dotnet"]))
         self.assertEqual(("", False, "3.12", "pyyaml"), (runner["node"], runner["dotnet"], runner["python"], runner["pip"]))
@@ -109,6 +109,16 @@ class CheckTests(unittest.TestCase):
                                  "node": "engineering/codebase/app.frontend-services/.nvmrc"})
         self.assertEqual(("", "10.0.x", 0), (entry["dotnet-json"], entry["dotnet-version"], entry["fetch-depth"]))
         self.assertEqual("engineering/codebase/app.frontend-services/pnpm-lock.yaml", entry["pnpm-lock"])
+
+    def test_lfs_fetches_everything_or_only_the_given_patterns_and_a_backend_may_name_its_lockfile(self):
+        self.assertEqual("*", ci_plan.backend({"name": "A", "run": "x", "lfs": True})["lfs"])
+        self.assertEqual("engineering/codebase/**",
+                         ci_plan.backend({"name": "A", "run": "x", "lfs": "engineering/codebase/**"})["lfs"])
+        entry = ci_plan.backend({"name": "A", "run": "x", "node": ".nvmrc", "pnpm-lock": "web/pnpm-lock.yaml"})
+        self.assertEqual(("pnpm-lock.yaml", "web/pnpm-lock.yaml"),
+                         (ci_plan.backend({"name": "A", "run": "x", "node": ".nvmrc"})["pnpm-lock"], entry["pnpm-lock"]))
+        with self.assertRaisesRegex(ci_plan.Invalid, "lfs is true"):
+            ci_plan.backend({"name": "A", "run": "x", "lfs": 3})
 
     def test_commands_may_be_a_list_of_lines(self):
         entry = ci_plan.backend({"name": "Runner (VPS kit)", "run": ["bash -n a.sh", "python -m unittest"]})

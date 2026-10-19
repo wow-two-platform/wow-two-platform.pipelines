@@ -52,6 +52,17 @@ SETTINGS_FILE = "/app/appsettings.Target.json"
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
                 "needs", "capabilities", "dependsOn"}
 TOP_KEYS = {"descriptor", "product", "platform", "shared", "sites", "services", "dotnetEnvironment", "verify"}
+# What a declared setting's value must look like; Wheelhouse checks each value it saves against the same rules.
+SETTING_TYPES = ("text", "number", "boolean", "choice", "url", "cron", "date", "email")
+SETTING_KEY = re.compile(r"[A-Za-z0-9_.-]{1,100}(?::[A-Za-z0-9_.-]{1,100}){0,9}")
+KEY_FIELDS = {"type", "required", "secret", "default", "values", "format"}
+DATE_FORMAT = re.compile(r"(yyyy|MM|dd|HH|mm|ss|[-./: T])+")
+DEFAULT_DATE_FORMAT = "yyyy-MM-dd"
+NUMBER = re.compile(r"-?(0|[1-9][0-9]{0,30})(\.[0-9]{1,30})?")
+EMAIL = re.compile(r"[^@\s]{1,64}@[^@\s.]+(\.[^@\s.]+)+")
+CRON_MACROS = {"@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly"}
+CRON_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+CRON_DAYS = ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT")
 # The end-to-end check after a dev rollout: how long it may run, by default and at most.
 VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
 
@@ -241,13 +252,19 @@ def service_of(name, service, claimed, roles=None):
     check(DURATION.fullmatch(grace), name + ": stopGrace must look like 30s")
     settings = service.get("settings")
     if settings is not None:
-        check(isinstance(settings, dict) and set(settings) <= {"file", "required"}, name + ": settings takes file and required")
+        check(isinstance(settings, dict) and set(settings) <= {"file", "required", "keys"},
+              name + ": settings takes file, required and keys")
         file = settings.get("file", SETTINGS_FILE)
         required = settings.get("required") or []
         check(isinstance(file, str) and file.startswith("/"), name + ": settings file must be an absolute path")
         check(isinstance(required, list) and all(isinstance(key, str) and key for key in required),
               name + ": settings required must list keys")
+        keys = setting_keys(name, settings.get("keys"))
+        required = list(required) + [key for key, entry in keys.items() if entry["required"] and key not in required]
         settings = {"file": file, "required": required}
+        # Only a descriptor that types its keys carries them, so every other descriptor validates as before.
+        if keys:
+            settings["keys"] = keys
     volumes = service.get("volumes") or {}
     check(isinstance(volumes, dict) and all(isinstance(key, str) and SLUG.fullmatch(key) and isinstance(path, str)
                                             and path.startswith("/") for key, path in volumes.items()),
@@ -306,6 +323,157 @@ def service_of(name, service, claimed, roles=None):
             "paths": [relative(path, name + ": path") for path in paths], "port": port, "health": test,
             "memory": memory, "stopGrace": grace, "settings": settings, "volumes": volumes, "sites": sites,
             "needs": needs, "capabilities": capabilities, "dependsOn": depends}
+
+
+def setting_keys(name, declared):
+    """A service's typed setting keys: each `type` (default text), whether it is `required` or a `secret`, a `default`
+    for an optional plain key, a choice key's `values` and a date key's `format`. Defaults are checked against their
+    type by the rules Wheelhouse checks saved values with."""
+    if declared is None:
+        return {}
+    check(isinstance(declared, dict), name + ": settings keys must map keys to their declarations")
+    keys = {}
+    for key, entry in declared.items():
+        what = name + ": setting " + str(key)
+        check(isinstance(key, str) and SETTING_KEY.fullmatch(key), what + " must be a configuration path such as Section:Key")
+        entry = {} if entry is None else entry
+        check(isinstance(entry, dict) and set(entry) <= KEY_FIELDS,
+              what + " takes type, required, secret, default, values and format")
+        kind = entry.get("type", "text")
+        check(kind in SETTING_TYPES, what + ": type must be one of " + ", ".join(SETTING_TYPES))
+        required, secret = entry.get("required", False), entry.get("secret", False)
+        check(type(required) is bool and type(secret) is bool, what + ": required and secret must be true or false")
+        values = entry.get("values")
+        if kind == "choice":
+            check(isinstance(values, list) and 0 < len(values) <= 50
+                  and all(isinstance(value, (str, int, float, bool)) for value in values),
+                  what + ": a choice lists 1-50 values")
+            values = [scalar(value) for value in values]
+            check(all(0 < len(value) <= 200 for value in values) and len(set(values)) == len(values),
+                  what + ": choice values must be distinct, 1-200 characters each")
+        else:
+            check(values is None, what + ": only a choice lists values")
+        form = entry.get("format")
+        if kind == "date":
+            form = DEFAULT_DATE_FORMAT if form is None else form
+            check(isinstance(form, str) and len(form) <= 40 and DATE_FORMAT.fullmatch(form)
+                  and all(part in form for part in ("yyyy", "MM", "dd")),
+                  what + ": a date format uses yyyy, MM, dd, HH, mm and ss, such as yyyy-MM-dd")
+        else:
+            check(form is None, what + ": only a date takes a format")
+        result = {"type": kind, "required": required, "secret": secret}
+        if "default" in entry:
+            check(not secret, what + ": a secret takes no default; its value lives in the vault")
+            check(not required, what + ": a required key takes no default")
+            default = scalar(entry["default"])
+            check(len(default) <= 2000 and "\n" not in default, what + ": default must be one line")
+            problem = type_problem(kind, default, form, values)
+            check(problem is None, what + ": default " + (problem or ""))
+            result["default"] = default
+        if values is not None:
+            result["values"] = values
+        if kind == "date":
+            result["format"] = form
+        keys[key] = result
+    return keys
+
+
+def scalar(value):
+    """A YAML scalar as the string a settings file holds: booleans lowercase, dates in ISO form."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    check(isinstance(value, (str, int, float)), "setting values must be strings, numbers or booleans")
+    return str(value)
+
+
+def type_problem(kind, value, form=None, values=None):
+    """Why a value does not fit its type, or None; the text never quotes the value."""
+    if kind == "number":
+        return None if NUMBER.fullmatch(value) else "must be a number, such as 42 or 0.5"
+    if kind == "boolean":
+        return None if value in ("true", "false") else "must be true or false"
+    if kind == "choice":
+        return None if value in (values or []) else "must be one of the values"
+    if kind == "url":
+        import urllib.parse
+        parts = urllib.parse.urlsplit(value)
+        return None if parts.scheme in ("http", "https") and parts.netloc and not any(c.isspace() for c in value) \
+            else "must be an absolute http or https link"
+    if kind == "cron":
+        return None if is_cron(value) else "must be a cron expression of five or six fields, or @daily and the like"
+    if kind == "date":
+        import datetime
+        pattern = form or DEFAULT_DATE_FORMAT
+        for token, code in (("yyyy", "%Y"), ("MM", "%m"), ("dd", "%d"), ("HH", "%H"), ("mm", "%M"), ("ss", "%S")):
+            pattern = pattern.replace(token, code)
+        try:
+            datetime.datetime.strptime(value, pattern)
+            return None
+        except ValueError:
+            return "must be a date as " + (form or DEFAULT_DATE_FORMAT)
+    if kind == "email":
+        return None if EMAIL.fullmatch(value) else "must be an email address"
+    return None
+
+
+def is_cron(value):
+    """A cron expression: five fields (minute, hour, day, month, weekday), six with seconds first, or a macro."""
+    if value != value.strip() or not value or len(value) > 200:
+        return False
+    if value.startswith("@"):
+        return value in CRON_MACROS
+    fields = value.split()
+    if len(fields) not in (5, 6):
+        return False
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+    if len(fields) == 6:
+        ranges = [(0, 59)] + ranges
+    for index, field in enumerate(fields):
+        position = index - (len(fields) - 5)
+        names = CRON_MONTHS if position == 3 else CRON_DAYS if position == 4 else None
+        if not all(cron_part(part, ranges[index], names, position in (2, 4)) for part in field.split(",")):
+            return False
+    return True
+
+
+def cron_part(part, bounds, names, allows_last):
+    def number(token, empty=False):
+        if token == "":
+            return empty
+        found = int(token) if token.isdigit() else (names.index(token.upper()) + (1 if names is CRON_MONTHS else 0)
+                                                   if names and token.upper() in names else -1)
+        return bounds[0] <= found <= bounds[1]
+
+    def value_of(token):
+        return int(token) if token.isdigit() else names.index(token.upper()) + (1 if names is CRON_MONTHS else 0)
+
+    step = part.split("/")
+    if not part or len(step) > 2 or (len(step) == 2 and not (step[1].isdigit() and int(step[1]) > 0)):
+        return False
+    head = step[0]
+    if head in ("*", "?"):
+        return head == "*" or len(step) == 1
+    if allows_last and len(step) == 1 and (head == "L" or head.endswith("L") or "#" in head or head.endswith("W")):
+        base = head.rstrip("LW").split("#")[0]
+        nth = head.split("#")[1] if "#" in head else None
+        return number(base, empty=head == "L") and (nth is None or (nth.isdigit() and 1 <= int(nth) <= 5))
+    bounds_of = head.split("-")
+    if len(bounds_of) > 2 or not all(number(token) for token in bounds_of):
+        return False
+    return len(bounds_of) == 1 or value_of(bounds_of[0]) <= value_of(bounds_of[1])
+
+
+def bundle_settings(keys):
+    """What a bundle declares about a service's typed keys, as the runner reads it: `optional` defaults, the `secrets`,
+    each choice's `allowed` values and every key's `types` entry (a date with its format). Empty parts are left out."""
+    declared = {"optional": {key: entry["default"] for key, entry in keys.items() if "default" in entry},
+                "secrets": [key for key, entry in keys.items() if entry["secret"]],
+                "allowed": {key: entry["values"] for key, entry in keys.items() if "values" in entry},
+                "types": {key: {"type": entry["type"], **({"format": entry["format"]} if "format" in entry else {})}
+                          for key, entry in keys.items()}}
+    return {part: value for part, value in declared.items() if value}
 
 
 # ---------------------------------------------------------------------- change
@@ -560,6 +728,11 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
     if second:
         manifest["routes"] = served
     manifest["needs"] = {name: service["needs"] for name, service in descriptor["services"].items() if service["needs"]}
+    # Written only when a service types its keys, so every other bundle stays byte for byte the same.
+    typed = {name: bundle_settings(service["settings"]["keys"]) for name, service in descriptor["services"].items()
+             if service["settings"] and service["settings"].get("keys")}
+    if typed:
+        manifest["settings"] = typed
     # Written only when declared, so a release that declares neither keeps its bundle byte for byte.
     if descriptor.get("dotnetEnvironment"):
         manifest["dotnetEnvironment"] = True

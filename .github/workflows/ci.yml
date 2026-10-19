@@ -1,7 +1,7 @@
 # The shared CI every product runs, through delivery.yml on a push or directly: plan, backend, frontend, browser, gate.
 #   plan     reads what changed since the last delivered commit (generator/ci_plan.py) and picks the checks: a docs-only
 #            change runs none, a check with `paths` runs when they change, a path no check owns runs every check
-#   backend  .NET, Python or shell checks, one job each; NuGet and pnpm caches
+#   backend  .NET, Python or shell checks, one job each; NuGet and pnpm caches; LFS files only where a check reads them
 #   frontend pnpm workspaces: frozen install, then the listed package.json scripts; pnpm cache
 #   browser  one job per shard, with $SHARD and $SHARDS; evidence uploaded on failure
 #   gate     the one result to wait on: it passes when every selected check passed, also on a docs-only change, and is
@@ -118,8 +118,14 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
           fetch-depth: ${{ matrix.fetch-depth }}
-          lfs: ${{ matrix.lfs }}
-          persist-credentials: false
+      - name: Fetch the Git LFS files the check reads
+        if: matrix.lfs != ''
+        working-directory: .
+        env:
+          LFS_INCLUDE: ${{ matrix.lfs }}
+        run: |
+          git lfs install --local
+          if [ "$LFS_INCLUDE" = '*' ]; then git lfs pull; else git lfs pull --include="$LFS_INCLUDE"; fi
       - name: Check out the release generator at this workflow's own commit
         if: matrix.pipelines
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -194,8 +200,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.commit || github.sha }}
-          lfs: ${{ matrix.lfs }}
-          persist-credentials: false
+      - name: Fetch the Git LFS files the check reads
+        if: matrix.lfs != ''
+        working-directory: .
+        env:
+          LFS_INCLUDE: ${{ matrix.lfs }}
+        run: |
+          git lfs install --local
+          if [ "$LFS_INCLUDE" = '*' ]; then git lfs pull; else git lfs pull --include="$LFS_INCLUDE"; fi
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: ${{ inputs.pnpm-version }}
@@ -231,8 +243,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.commit || github.sha }}
-          lfs: ${{ matrix.lfs }}
-          persist-credentials: false
+      - name: Fetch the Git LFS files the check reads
+        if: matrix.lfs != ''
+        working-directory: .
+        env:
+          LFS_INCLUDE: ${{ matrix.lfs }}
+        run: |
+          git lfs install --local
+          if [ "$LFS_INCLUDE" = '*' ]; then git lfs pull; else git lfs pull --include="$LFS_INCLUDE"; fi
       - name: Set up .NET
         if: matrix.dotnet
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1

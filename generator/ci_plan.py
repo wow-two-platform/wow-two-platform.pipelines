@@ -36,8 +36,8 @@ DELIVERED_JOB = re.compile(r"(?:^|/ )(?:gate|publish / bundle)$")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()/-]{0,59}")
 SHA = re.compile(r"[a-f0-9]{40}")
 
-BACKEND_KEYS = {"name", "run", "dir", "dotnet", "node", "python", "pip", "pip-cache", "lfs", "history", "pipelines",
-                "paths", "timeout"}
+BACKEND_KEYS = {"name", "run", "dir", "dotnet", "node", "pnpm-lock", "python", "pip", "pip-cache", "lfs", "history",
+                "pipelines", "paths", "timeout"}
 FRONTEND_KEYS = {"name", "dir", "scripts", "node", "lfs", "paths", "timeout"}
 BROWSER_KEYS = {"name", "dir", "shards", "setup", "run", "dotnet", "node", "lfs", "paths", "artifact", "timeout"}
 
@@ -108,15 +108,18 @@ def common(entry, keys, what, default_timeout):
     check(not unknown, what + " takes no " + ", ".join(sorted(unknown)))
     name = entry.get("name")
     check(isinstance(name, str) and NAME.fullmatch(name), what + " needs a name of letters, digits, spaces and ._()/-")
-    for key in ("lfs", "history", "pipelines"):
+    for key in ("history", "pipelines"):
         check(isinstance(entry.get(key, False), bool), name + ": " + key + " is true or false")
+    lfs = entry.get("lfs", False)
+    check(isinstance(lfs, bool) or (isinstance(lfs, str) and lfs.strip()),
+          name + ": lfs is true (every LFS file) or the git lfs --include patterns to fetch")
     timeout = entry.get("timeout", default_timeout)
     check(type(timeout) is int and 1 <= timeout <= 120, name + ": timeout is 1-120 minutes")
     directory = entry.get("dir", ".")
     check(isinstance(directory, str) and directory and not directory.startswith("/") and ".." not in directory.split("/"),
           name + ": dir is a relative path inside the repository")
     return {"name": name, "slug": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"),
-            "dir": directory.rstrip("/") or ".", "lfs": entry.get("lfs", False),
+            "dir": directory.rstrip("/") or ".", "lfs": "*" if lfs is True else lfs or "",
             "timeout": timeout, "paths": strings(entry["paths"], name + ": paths") if "paths" in entry else None}
 
 
@@ -151,8 +154,9 @@ def backend(entry):
     check(not entry.get("pip") or entry.get("python"), name + ": pip needs python")
     check(not entry.get("pip-cache") or entry.get("python"), name + ": pip-cache needs python")
     node = node_of(entry, name, base["dir"], False)
-    return {**base, **dotnet_of(entry, name), "run": run, "node": node,
-            "pnpm-lock": lockfile(str(Path(node).parent)) if node else "",
+    lock = entry.get("pnpm-lock", lockfile(str(Path(node).parent)) if node else "")
+    check(isinstance(lock, str) and (lock or not node), name + ": pnpm-lock is the pnpm-lock.yaml the Node cache keys on")
+    return {**base, **dotnet_of(entry, name), "run": run, "node": node, "pnpm-lock": lock,
             "python": entry.get("python", ""), "pip": entry.get("pip", ""), "pip-cache": entry.get("pip-cache", ""),
             "fetch-depth": 0 if entry.get("history") else 1, "pipelines": entry.get("pipelines", False)}
 

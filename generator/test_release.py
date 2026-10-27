@@ -197,6 +197,51 @@ class DescriptorTests(unittest.TestCase):
                "    paths: [codebase/**]\n    health: /health\n"
         self.assertEqual(["api"], list(release.validate(release.parse(text))["services"]))
 
+    def test_an_identity_is_checked_and_left_out_of_the_validated_descriptor(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared.update(name="Pilot", description="Flies the sample product.", homepage="https://pilot.example/start")
+        declared["services"]["api"].update(name="API", description="Answers the app.")
+        declared["services"]["edge"]["name"] = "Site"
+        self.assertEqual(release.validate(copy.deepcopy(DESCRIPTOR)), release.validate(declared))
+        self.assertEqual({"name": "Pilot", "description": "Flies the sample product.",
+                          "homepage": "https://pilot.example/start"}, release.identity_of(declared))
+        self.assertIsNone(release.identity_of(copy.deepcopy(DESCRIPTOR)))
+        del declared["homepage"]
+        self.assertEqual({"name": "Pilot", "description": "Flies the sample product."}, release.identity_of(declared))
+
+    def test_identity_rule_breaks_name_the_rule(self):
+        cases = (
+            (lambda d: d.update(name="Pilot"), "needs both name and description"),
+            (lambda d: d.update(homepage="https://pilot.example"), "needs both name and description"),
+            (lambda d: d.update(name="n" * 81, description="x"), "name must be one line of 1-80"),
+            (lambda d: d.update(name="", description="x"), "name must be one line"),
+            (lambda d: d.update(name=42, description="x"), "name must be one line"),
+            (lambda d: d.update(name="Pilot", description=" padded"), "description must be one line"),
+            (lambda d: d.update(name="Pilot", description="two\nlines"), "description must be one line"),
+            (lambda d: d.update(name="Pilot", description="d" * 201), "description must be one line of 1-200"),
+            (lambda d: d.update(name="Pilot", description="x", homepage="javascript:alert(1)"), "homepage must be"),
+            (lambda d: d.update(name="Pilot", description="x", homepage="https://user:pw@pilot.example"), "homepage must be"),
+            (lambda d: d.update(name="Pilot", description="x", homepage="https://" + "h" * 300), "homepage must be"),
+            (lambda d: d["services"]["api"].update(name=""), "api: name must be one line"),
+            (lambda d: d["services"]["api"].update(description="d" * 201), "api: description must be one line of 1-200"),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                descriptor = copy.deepcopy(DESCRIPTOR)
+                mutate(descriptor)
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(descriptor)
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
+    def test_a_yaml_identity_parses(self):
+        text = "descriptor: 1\nproduct: pilot\nname: Pilot\ndescription: Flies the sample product.\n" \
+               "homepage: https://pilot.example\nservices:\n  api:\n    name: API\n" \
+               "    build: {dockerfile: deployment/Dockerfile}\n    paths: [codebase/**]\n    health: /health\n"
+        parsed = release.parse(text)
+        release.validate(parsed)
+        self.assertEqual({"name": "Pilot", "description": "Flies the sample product.", "homepage": "https://pilot.example"},
+                         release.identity_of(parsed))
+
 
 DESCRIPTOR_2 = {
     "descriptor": 2, "product": "pilot",
@@ -549,6 +594,16 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("dotnetEnvironment", written)
         self.assertNotIn("verify", written)
         self.assertEqual(set(), {name for name, service in compose["services"].items() if "depends_on" in service})
+
+    def test_a_declared_identity_leaves_the_bundle_byte_for_byte_the_same(self):
+        plain = release.validate(copy.deepcopy(DESCRIPTOR))
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared.update(name="Pilot", description="Flies the sample product.", homepage="https://pilot.example")
+        declared["services"]["api"].update(name="API", description="Answers the app.")
+        identified = release.validate(declared)
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in plain["services"]}
+        self.assertEqual(release.render(plain, release.plan(plain, self.repo, self.first, None), images),
+                         release.render(identified, release.plan(identified, self.repo, self.first, None), images))
 
     def test_declared_dependencies_render_as_health_gated_compose_dependencies(self):
         declared = copy.deepcopy(DESCRIPTOR)

@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   delivery:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.10.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.11.0
     with:
       commit: ${{ inputs.commit }}
       backends: |
@@ -148,6 +148,11 @@ a list of lines, run with `bash -eo pipefail`.
   `release.json` carries the rest under `settings.<service>` (`optional`, `secrets`, `allowed`, `types`), which
   Wheelhouse's runner reads and its console checks saved values against. A bundle without typed keys is byte for byte
   as before; an older tag refuses the key, and a runner older than Wheelhouse v0.5 refuses `types`.
+- From `v0.11.0` a descriptor may declare the product's identity: `name` and `description` together, an optional
+  `homepage` (an http or https address without credentials), and a service's own `name` and `description`. Each text is
+  one line without control characters or leading or trailing space: names 1–80 characters, descriptions 1–200. The
+  generator checks them and leaves them out of the bundle, which stays byte for byte the same; Wheelhouse reads them
+  from the repository in place of the retired `product/product.json`. An older tag refuses the keys.
 
 ## Security checks
 

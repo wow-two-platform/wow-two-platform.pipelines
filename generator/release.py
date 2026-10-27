@@ -50,8 +50,14 @@ SITE_KEYS = {"exposure", "primary", "environments"}
 # appsettings.{Environment}.json. Bundles before v0.7.0 mounted /app/appsettings.Local.json, now a machine's own file.
 SETTINGS_FILE = "/app/appsettings.Target.json"
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
-                "needs", "capabilities", "dependsOn"}
-TOP_KEYS = {"descriptor", "product", "platform", "shared", "sites", "services", "dotnetEnvironment", "verify"}
+                "needs", "capabilities", "dependsOn", "name", "description"}
+TOP_KEYS = {"descriptor", "product", "platform", "shared", "sites", "services", "dotnetEnvironment", "verify",
+            "name", "description", "homepage"}
+# The product's identity: its display name, one line on what it does and its public address, and each service's own
+# name and description. Wheelhouse reads them from the repository at a commit; bundles never carry them.
+NAME_LIMIT, DESCRIPTION_LIMIT, HOMEPAGE_LIMIT = 80, 200, 300
+ONE_LINE = re.compile(r"\S(?:[^\x00-\x1f\x7f]*\S)?")
+HOMEPAGE = re.compile(r"https?://[^\s@/?#]+(?:[/?#]\S*)?")
 # What a declared setting's value must look like; Wheelhouse checks each value it saves against the same rules.
 SETTING_TYPES = ("text", "number", "boolean", "choice", "url", "cron", "date", "email")
 SETTING_KEY = re.compile(r"[A-Za-z0-9_.-]{1,100}(?::[A-Za-z0-9_.-]{1,100}){0,9}")
@@ -105,6 +111,7 @@ def validate(descriptor):
     check(version == 2 or "sites" not in descriptor, "Top-level sites need descriptor 2")
     check(isinstance(descriptor.get("product"), str) and SLUG.fullmatch(descriptor["product"]),
           "product must be a lowercase slug")
+    identity_of(descriptor)
     platform = descriptor.get("platform", "linux/amd64")
     check(platform in PLATFORMS, "platform must be linux/amd64 or linux/arm64")
     shared = descriptor.get("shared") or []
@@ -121,6 +128,9 @@ def validate(descriptor):
         check(isinstance(service, dict), name + ": a service must be a mapping")
         unknown = set(service) - SERVICE_KEYS
         check(not unknown, name + ": unknown key " + ", ".join(sorted(map(str, unknown))))
+        for key, limit in (("name", NAME_LIMIT), ("description", DESCRIPTION_LIMIT)):
+            if key in service:
+                one_line(service[key], name + ": " + key, limit)
         result["services"][name] = service_of(name, service, claimed, roles)
     if roles is not None:
         served = {site for site, _ in claimed}
@@ -133,6 +143,30 @@ def validate(descriptor):
     result["dotnetEnvironment"] = dotnet
     result["verify"] = verify_of(descriptor.get("verify"), result["services"])
     return result
+
+
+def one_line(value, what, limit):
+    """A display text: one line of 1 to `limit` characters, no control characters, no leading or trailing space."""
+    check(isinstance(value, str) and len(value) <= limit and ONE_LINE.fullmatch(value),
+          what + " must be one line of 1-" + str(limit) + " characters, without leading or trailing space")
+    return value
+
+
+def identity_of(descriptor):
+    """Checks the product's identity, which the bundle leaves out: Wheelhouse reads it from the repository at a commit.
+    An identity names both `name` and `description`; `homepage` is optional, an http or https address without
+    credentials. A descriptor without any of the three declares none, and validates as before."""
+    if not {"name", "description", "homepage"} & set(descriptor):
+        return None
+    check("name" in descriptor and "description" in descriptor, "An identity needs both name and description")
+    identity = {"name": one_line(descriptor["name"], "name", NAME_LIMIT),
+                "description": one_line(descriptor["description"], "description", DESCRIPTION_LIMIT)}
+    if "homepage" in descriptor:
+        homepage = descriptor["homepage"]
+        check(isinstance(homepage, str) and len(homepage) <= HOMEPAGE_LIMIT and HOMEPAGE.fullmatch(homepage),
+              "homepage must be an http or https address without credentials, at most 300 characters")
+        identity["homepage"] = homepage
+    return identity
 
 
 def seconds(value, what):

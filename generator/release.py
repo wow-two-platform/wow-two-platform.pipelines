@@ -52,7 +52,7 @@ SETTINGS_FILE = "/app/appsettings.Target.json"
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
                 "needs", "capabilities", "dependsOn", "name", "description"}
 TOP_KEYS = {"descriptor", "product", "platform", "shared", "sites", "services", "dotnetEnvironment", "verify",
-            "name", "description", "homepage"}
+            "name", "description", "homepage", "migrate", "extensions"}
 # The product's identity: its display name, one line on what it does and its public address, and each service's own
 # name and description. Wheelhouse reads them from the repository at a commit; bundles never carry them.
 NAME_LIMIT, DESCRIPTION_LIMIT, HOMEPAGE_LIMIT = 80, 200, 300
@@ -71,6 +71,10 @@ CRON_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "O
 CRON_DAYS = ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT")
 # The end-to-end check after a dev rollout: how long it may run, by default and at most.
 VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
+# The migrate step, one item per image that hosts a migration set: how long an item may run, by default and at most.
+MIGRATE_TIMEOUT, MIGRATE_TIMEOUT_LIMIT = 600, 3600
+# An untrusted PostgreSQL extension Wheelhouse creates as superuser when it places the product's database.
+EXTENSION = re.compile(r"[a-z][a-z0-9_-]{0,62}")
 
 
 class Invalid(ValueError):
@@ -142,6 +146,11 @@ def validate(descriptor):
     check(type(dotnet) is bool, "dotnetEnvironment must be true or false")
     result["dotnetEnvironment"] = dotnet
     result["verify"] = verify_of(descriptor.get("verify"), result["services"])
+    # Each is carried only when declared, so every other descriptor validates and bundles as before.
+    if "migrate" in descriptor:
+        result["migrate"] = migrate_of(descriptor["migrate"], result["services"])
+    if "extensions" in descriptor:
+        result["extensions"] = extensions_of(descriptor["extensions"])
     return result
 
 
@@ -190,6 +199,42 @@ def verify_of(verify, services):
     timeout = seconds(verify.get("timeout", str(VERIFY_TIMEOUT) + "s"), "verify timeout")
     check(10 <= timeout <= VERIFY_TIMEOUT_LIMIT, "verify timeout must be 10s-30m")
     return {"service": verify["service"], "command": command, "timeoutSeconds": timeout}
+
+
+def migrate_of(items, services):
+    """The migrate step: one item per image that hosts a migration set, which the runner runs after the pull and before
+    the first wave on every forward deploy. Each names a service of this descriptor whose release image runs `command`
+    (ending in the bare `migrate` verb) as its entrypoint, bounded by `timeout`: 10m by default, 10s-60m."""
+    check(isinstance(items, list) and items, "migrate must list at least one item: service, command and timeout")
+    result, listed = [], set()
+    for number, item in enumerate(items, 1):
+        what = "migrate item " + str(number)
+        check(isinstance(item, dict) and set(item) <= {"service", "command", "timeout"},
+              what + " takes service, command and timeout")
+        service = item.get("service")
+        check(isinstance(service, str) and service in services,
+              what + ": service must name a service of this descriptor"
+              + (" (" + service + " is not one)" if isinstance(service, str) else ""))
+        check(service not in listed, "migrate lists " + service + " twice; declare one item per image")
+        listed.add(service)
+        command = item.get("command")
+        check(isinstance(command, list) and 0 < len(command) <= 32
+              and all(isinstance(part, str) and part and len(part) <= 1000 and "\0" not in part for part in command),
+              "migrate " + service + ": command must list the program and its arguments, such as "
+              "[dotnet, Product.Api.dll, migrate]")
+        timeout = seconds(item.get("timeout", str(MIGRATE_TIMEOUT // 60) + "m"), "migrate " + service + " timeout")
+        check(10 <= timeout <= MIGRATE_TIMEOUT_LIMIT, "migrate " + service + " timeout must be 10s-60m")
+        result.append({"service": service, "command": list(command), "timeoutSeconds": timeout})
+    return result
+
+
+def extensions_of(declared):
+    """The untrusted PostgreSQL extensions the product's sets need, which Wheelhouse creates as superuser when it places
+    the database; a set creates trusted ones itself."""
+    check(isinstance(declared, list) and all(isinstance(name, str) and EXTENSION.fullmatch(name) for name in declared),
+          "extensions must list PostgreSQL extension names: a lowercase letter, then up to 62 of a-z, 0-9, _ and -")
+    check(len(set(declared)) == len(declared), "extensions lists an extension twice")
+    return list(declared)
 
 
 def sites_of(declared):
@@ -772,6 +817,12 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
         manifest["dotnetEnvironment"] = True
     if descriptor.get("verify"):
         manifest["verify"] = descriptor["verify"]
+    # The migrate step's items, in the descriptor's order, and the untrusted extensions placement creates; each only
+    # when declared, so every other bundle stays byte for byte the same.
+    if "migrate" in descriptor:
+        manifest["migrate"] = descriptor["migrate"]
+    if "extensions" in descriptor:
+        manifest["extensions"] = descriptor["extensions"]
     if branch:
         manifest["branch"] = branch
     if identity:

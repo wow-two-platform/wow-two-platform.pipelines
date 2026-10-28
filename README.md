@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   delivery:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.11.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.12.0
     with:
       commit: ${{ inputs.commit }}
       backends: |
@@ -153,6 +153,31 @@ a list of lines, run with `bash -eo pipefail`.
   one line without control characters or leading or trailing space: names 1–80 characters, descriptions 1–200. The
   generator checks them and leaves them out of the bundle, which stays byte for byte the same; Wheelhouse reads them
   from the repository in place of the retired `product/product.json`. An older tag refuses the keys.
+- From `v0.12.0` a descriptor may declare the migrate step (`migrate`) and the untrusted PostgreSQL extensions its sets
+  need (`extensions`) — [below](#migrations-pinned-images-and-extensions). An older tag refuses each key.
+
+## Migrations, pinned images and extensions
+
+Rules: `wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md` § *Migrate*. Each key reaches `release.json`
+only when declared, so a descriptor without them builds its bundle byte for byte as `v0.11.0` did.
+
+```yaml
+migrate:                              # one item per image that hosts a migration set
+  - service: management               # a service of this descriptor
+    command: [dotnet, ForeverPin.Api.dll, migrate]   # the image's entrypoint and arguments, ending in the bare migrate verb
+    timeout: 10m                      # default 10m; 10s-60m
+extensions: [postgres_fdw]            # untrusted extensions only; a set creates trusted ones
+```
+
+- `migrate` lists at least one item. The generator refuses an item whose `service` is not a service of this
+  descriptor, a service listed twice, a `command` that is not 1–32 non-empty strings, and a `timeout` outside
+  `10s`–`60m` (written like `90s`, `10m` or `1h`).
+- `extensions` lists PostgreSQL extension names once each: a lowercase letter, then up to 62 of `a-z`, `0-9`, `_`, `-`.
+
+| `release.json` key | Written when | Value |
+|---|---|---|
+| `migrate` | `migrate` is declared | `[{"service", "command", "timeoutSeconds"}]`, in the descriptor's order |
+| `extensions` | `extensions` is declared, even empty | the declared names, in order |
 
 ## Security checks
 

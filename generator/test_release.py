@@ -400,6 +400,122 @@ services:
         self.assertEqual({"studio": {"port": 8080, "paths": ["/"]}}, descriptor["services"]["studio"]["sites"])
 
 
+MIGRATE = [{"service": "api", "command": ["dotnet", "Pilot.Api.dll", "migrate"]},
+           {"service": "edge", "command": ["/app/edge", "migrate"], "timeout": "90s"}]
+
+
+def fixed_bundle(descriptor, images=None):
+    """release.json and compose.json bytes for a fixed main release of every service, as the workflow writes them."""
+    planned = {"release": "v1.0.0", "kind": "release", "sourceCommit": "c" * 40,
+               "services": {name: {"version": "1.0.0", "changedIn": "v1.0.0"} for name in descriptor["services"]}}
+    images = images or {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+    compose_bytes, manifest = release.render(descriptor, planned, images, "main",
+                                             identity={"version": "1.0.0", "channel": "release"})
+    return (json.dumps(manifest, indent=2) + "\n").encode(), compose_bytes
+
+
+class MigrateTests(unittest.TestCase):
+    """The migrate step's items and the untrusted extensions: checked, and carried only when declared."""
+
+    def declared(self, **keys):
+        descriptor = copy.deepcopy(DESCRIPTOR)
+        descriptor.update(copy.deepcopy(keys))
+        return descriptor
+
+    def test_a_valid_list_builds_in_the_descriptors_order_with_its_timeouts(self):
+        descriptor = release.validate(self.declared(migrate=MIGRATE, extensions=["postgres_fdw", "pg-cron"]))
+        expected = [{"service": "api", "command": ["dotnet", "Pilot.Api.dll", "migrate"], "timeoutSeconds": 600},
+                    {"service": "edge", "command": ["/app/edge", "migrate"], "timeoutSeconds": 90}]
+        self.assertEqual(expected, descriptor["migrate"])
+        self.assertEqual(["postgres_fdw", "pg-cron"], descriptor["extensions"])
+        manifest = json.loads(fixed_bundle(descriptor)[0])
+        self.assertEqual(expected, manifest["migrate"])
+        self.assertEqual(["postgres_fdw", "pg-cron"], manifest["extensions"])
+        for bound in ("10s", "60m", "1h", "3600s"):
+            with self.subTest(timeout=bound):
+                items = [{"service": "api", "command": ["migrate"], "timeout": bound}]
+                self.assertEqual(1, len(release.validate(self.declared(migrate=items))["migrate"]))
+
+    def test_extensions_ride_alone_and_an_empty_list_is_declared(self):
+        manifest = json.loads(fixed_bundle(release.validate(self.declared(extensions=[])))[0])
+        self.assertEqual([], manifest["extensions"])
+        self.assertNotIn("migrate", manifest)
+
+    def test_rule_breaks_name_the_rule(self):
+        api = ["dotnet", "Pilot.Api.dll", "migrate"]
+        cases = (
+            ([{"service": "api", "command": api, "timeout": "5s"}], "migrate api timeout must be 10s-60m"),
+            ([{"service": "api", "command": api, "timeout": "61m"}], "migrate api timeout must be 10s-60m"),
+            ([{"service": "api", "command": api, "timeout": "2h"}], "migrate api timeout must be 10s-60m"),
+            ([{"service": "api", "command": api, "timeout": 600}], "migrate api timeout must look like"),
+            ([{"service": "api", "command": api, "timeout": "10 m"}], "migrate api timeout must look like"),
+            ([{"service": "worker", "command": api}], r"migrate item 1: service must name a service of this "
+                                                      r"descriptor \(worker is not one\)"),
+            ([{"service": "postgres", "command": api}], "service must name a service of this descriptor"),
+            ([{"command": api}], "migrate item 1: service must name a service"),
+            ([{"service": "api", "command": []}], "migrate api: command must list the program"),
+            ([{"service": "api"}], "migrate api: command must list the program"),
+            ([{"service": "api", "command": "dotnet Pilot.Api.dll migrate"}], "command must list the program"),
+            ([{"service": "api", "command": ["dotnet", ""]}], "command must list the program"),
+            ([{"service": "api", "command": ["x"] * 33}], "command must list the program"),
+            ([{"service": "api", "command": api, "image": "x"}], "migrate item 1 takes service, command and timeout"),
+            ([{"service": "api", "command": api}, {"service": "api", "command": api}], "migrate lists api twice"),
+            (["api"], "migrate item 1 takes service, command and timeout"),
+            ([], "migrate must list at least one item"),
+            (None, "migrate must list at least one item"),
+            ({"service": "api", "command": api}, "migrate must list at least one item"),
+        )
+        for items, message in cases:
+            with self.subTest(message=message, items=items):
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(self.declared(migrate=items))
+
+    def test_extension_rule_breaks_name_the_rule(self):
+        for extensions, message in ((["PostGIS"], "extensions must list PostgreSQL extension names"),
+                                    (["1cube"], "extensions must list"), (["x" * 64], "extensions must list"),
+                                    (["pg trgm"], "extensions must list"), ([7], "extensions must list"),
+                                    (None, "extensions must list"), ("postgis", "extensions must list"),
+                                    (["postgis", "postgis"], "extensions lists an extension twice")):
+            with self.subTest(extensions=extensions):
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(self.declared(extensions=extensions))
+
+    def test_a_descriptor_without_the_keys_builds_the_v0_11_0_bundle_byte_for_byte(self):
+        # The hashes of the bundles v0.11.0's generator wrote for these descriptors and inputs.
+        for declared, release_hash, compose_hash in (
+                (DESCRIPTOR, "c32b1d6e556fff4752a12a07bac3d1eca7cb4b1585cdc4b1340c42dd49939ee0",
+                 "a8e69c8526bbfe204dca10c7ec059508f2c0696148eea358407138be3ce15969"),
+                (DESCRIPTOR_2, "f8c6c236e7fc9d5deabcfee01783514deff3a1ec8b477ff6daf2ed49cd2620fa",
+                 "a81beeae65b80a2d8565e16fe8e8a04034395edfc62acb663db00948d3332f3f")):
+            with self.subTest(descriptor=declared["descriptor"]):
+                release_bytes, compose_bytes = fixed_bundle(release.validate(copy.deepcopy(declared)))
+                self.assertEqual((release_hash, compose_hash), (hashlib.sha256(release_bytes).hexdigest(),
+                                                                hashlib.sha256(compose_bytes).hexdigest()))
+                for key in ("migrate", "migrations", "migrationSets", "extensions"):
+                    self.assertNotIn('"' + key + '"', release_bytes.decode())
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
+    def test_the_documented_example_parses(self):
+        text = """
+descriptor: 2
+product: foreverpin
+services:
+  management:
+    build: { dockerfile: deployment/Dockerfile }
+    paths: [codebase/**]
+    health: /health
+migrate:                              # one item per image that hosts a set
+  - service: management               # hosts every set this repository owns
+    command: [dotnet, ForeverPin.Api.dll, migrate]
+    timeout: 10m                      # default 10m; 10s-60m
+extensions: [postgres_fdw]            # untrusted extensions only; a set creates trusted ones
+"""
+        descriptor = release.validate(release.parse(text))
+        self.assertEqual([{"service": "management", "command": ["dotnet", "ForeverPin.Api.dll", "migrate"],
+                           "timeoutSeconds": 600}], descriptor["migrate"])
+        self.assertEqual(["postgres_fdw"], descriptor["extensions"])
+
+
 class PlanTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

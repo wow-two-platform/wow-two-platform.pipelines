@@ -516,6 +516,157 @@ extensions: [postgres_fdw]            # untrusted extensions only; a set creates
         self.assertEqual(["postgres_fdw"], descriptor["extensions"])
 
 
+IDENTITY = "ghcr.io/wow-two-sdk-beta/wow-two-sdk-beta.identity/identity"
+PIN = "sha256:" + "d" * 64
+
+
+def with_pinned(declared=DESCRIPTOR, tag="0.3.0"):
+    """The descriptor plus `identity`, a per-product instance run from another repository's image pinned by tag."""
+    descriptor = copy.deepcopy(declared)
+    descriptor["services"]["identity"] = {
+        "image": IDENTITY + ":" + tag, "health": "/health", "needs": ["postgres"],
+        "settings": {"keys": {"DatabaseSettings:ConnectionString": {"required": True}}}}
+    return descriptor
+
+
+class PinnedImageTests(unittest.TestCase):
+    """A service that runs another repository's image at a release tag: never built, pinned by digest, versioned by
+    its tag."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary.name)
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "config", "user.name", "Test")
+        git(self.repo, "config", "commit.gpgsign", "false")
+        (self.repo / "engineering/codebase").mkdir(parents=True)
+        (self.repo / "engineering/codebase/one.cs").write_text("one")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "first")
+        self.first = git(self.repo, "rev-parse", "HEAD")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_a_pinned_image_validates_without_build_or_paths(self):
+        identity = release.validate(with_pinned())["services"]["identity"]
+        self.assertEqual((IDENTITY, "0.3.0", None, []),
+                         (identity["image"], identity["pinned"], identity["build"], identity["paths"]))
+        self.assertEqual(["DatabaseSettings:ConnectionString"], identity["settings"]["required"])
+        self.assertNotIn("pinned", release.validate(copy.deepcopy(DESCRIPTOR))["services"]["api"])
+        for image, tag in (("localhost:5000/identity:0.3.0", "0.3.0"), (IDENTITY + ":v0.3.0-rc.1", "v0.3.0-rc.1"),
+                           (IDENTITY + ":Stable_2", "Stable_2")):
+            with self.subTest(image=image):
+                declared = with_pinned()
+                declared["services"]["identity"]["image"] = image
+                self.assertEqual(tag, release.validate(declared)["services"]["identity"]["pinned"])
+
+    def test_rule_breaks_name_the_rule(self):
+        identity = lambda d: d["services"]["identity"]
+        cases = (
+            (lambda d: identity(d).update(image=IDENTITY + ":latest"), "identity: a pinned image needs a release tag, never latest"),
+            (lambda d: identity(d).update(image=IDENTITY), "identity: a pinned image needs a release tag"),
+            (lambda d: identity(d).update(image="localhost:5000/identity"), "a pinned image needs a release tag"),
+            (lambda d: identity(d).update(image=IDENTITY + "@" + PIN), "a pinned image needs a release tag"),
+            (lambda d: identity(d).update(image=IDENTITY + ":0.3.0@" + PIN), "a pinned image needs a release tag"),
+            (lambda d: identity(d).update(image="GHCR.io/o/identity:0.3.0"), "image must be a lowercase repository"),
+            (lambda d: identity(d).update(image=IDENTITY + ":0.3+1"), "image must be a lowercase repository"),
+            (lambda d: identity(d).update(image=IDENTITY + ":"), "image must be a lowercase repository"),
+            (lambda d: identity(d).update(image=7), "a pinned image needs a release tag"),
+            (lambda d: identity(d).update(build={"dockerfile": "deployment/identity.Dockerfile"}, paths=["codebase/**"]),
+             "identity: with build, image must be a repository without a tag"),
+            (lambda d: identity(d).update(paths=["codebase/**"]), "identity: a pinned image never builds, so it takes no paths"),
+            (lambda d: identity(d).pop("image"), "identity: a service needs build, or an image pinned by its release tag"),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                descriptor = with_pinned()
+                mutate(descriptor)
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(descriptor)
+
+    def test_no_path_rebuilds_a_pinned_image(self):
+        descriptor = release.validate(with_pinned())
+        self.assertEqual([], release.triggers(descriptor, "identity"))
+        self.assertEqual(["api", "edge"], release.changed_services(descriptor, [
+            "engineering/codebase/pilot.backend-services/Directory.Packages.props", "engineering/deployment/deploy.yml"]))
+
+    def test_the_plan_versions_it_by_its_tag_and_never_builds_it(self):
+        descriptor = release.validate(with_pinned())
+        planned = release.plan(descriptor, self.repo, self.first, None, "v1.0.0")
+        self.assertEqual({"build": False, "version": "0.3.0", "changedIn": "v1.0.0", "pinned": IDENTITY + ":0.3.0"},
+                         planned["services"]["identity"])
+        self.assertEqual({"api": True, "edge": True},
+                         {name: entry["build"] for name, entry in planned["services"].items() if name != "identity"})
+        base = {"product": "pilot", "release": "v1.0.0", "sourceCommit": self.first,
+                "images": {"api": "ghcr.io/o/pilot/api" + DIGEST, "edge": "ghcr.io/o/pilot/edge" + DIGEST,
+                           "identity": IDENTITY + "@" + PIN},
+                "versions": {"api": {"version": "1.0.0", "changedIn": "v1.0.0"},
+                             "edge": {"version": "1.0.0", "changedIn": "v1.0.0"},
+                             "identity": {"version": "0.3.0", "changedIn": "v0.9.0"}}}
+        kept = release.plan(descriptor, self.repo, self.first, base, "v1.0.1")
+        self.assertEqual(("0.3.0", "v0.9.0", False), tuple(kept["services"]["identity"][key]
+                                                           for key in ("version", "changedIn", "build")))
+        self.assertTrue(release.nothing_to_publish(kept))
+        bumped = release.plan(release.validate(with_pinned(tag="0.4.0")), self.repo, self.first, base, "v1.0.1")
+        self.assertEqual(("0.4.0", "v1.0.1"), (bumped["services"]["identity"]["version"],
+                                               bumped["services"]["identity"]["changedIn"]))
+        lost = release.plan(descriptor, self.repo, self.first, {**base, "sourceCommit": "1" * 40}, "v1.0.1")
+        self.assertEqual({"build": False, "version": "0.3.0", "changedIn": "v1.0.1", "pinned": IDENTITY + ":0.3.0"},
+                         lost["services"]["identity"])
+
+    def test_a_pinned_image_takes_the_digest_its_tag_resolved_to(self):
+        descriptor = release.validate(with_pinned())
+        self.assertEqual({"identity": IDENTITY + ":0.3.0"}, release.pins_of(descriptor))
+        self.assertEqual({}, release.pins_of(release.validate(copy.deepcopy(DESCRIPTOR))))
+        self.assertEqual({"identity": IDENTITY + "@" + PIN}, release.pinned_images(descriptor, {"identity": PIN}))
+        for pins, message in (({}, r"identity: pass the digest .*identity:0\.3\.0 resolves to, as --pin identity="),
+                              ({"identity": "sha256:abc"}, "--pin takes sha256: and 64 lowercase hex digits"),
+                              ({"identity": "D" * 64}, "--pin takes sha256"),
+                              ({"identity": PIN, "api": PIN}, "--pin names a service without a pinned image: api")):
+            with self.subTest(pins=pins):
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.pinned_images(descriptor, pins)
+        self.assertEqual({"identity": PIN}, release.pin_arguments(["identity=" + PIN]))
+        for values in (["identity"], ["identity=" + PIN, "identity=" + PIN]):
+            with self.assertRaisesRegex(release.Invalid, "--pin takes SERVICE=sha256:<digest>, once per service"):
+                release.pin_arguments(values)
+
+    def test_the_bundle_pins_the_digest_in_compose_and_versions_the_service_by_its_tag(self):
+        descriptor = release.validate(with_pinned())
+        planned = release.plan(descriptor, self.repo, self.first, None, "v1.0.0")
+        images = release.build(descriptor, {**planned, "services": {
+            name: ({**entry, "build": False, "image": "ghcr.io/o/pilot/" + name + DIGEST} if name != "identity" else entry)
+            for name, entry in planned["services"].items()}}, self.repo, "ghcr.io/o/pilot", {}, pins={"identity": PIN})
+        compose_bytes, manifest = release.render(descriptor, planned, images)
+        self.assertEqual(IDENTITY + "@" + PIN, manifest["images"]["identity"])
+        self.assertEqual({"version": "0.3.0", "changedIn": "v1.0.0"}, manifest["versions"]["identity"])
+        self.assertEqual(IDENTITY + "@" + PIN, json.loads(compose_bytes)["services"]["identity"]["image"])
+        self.assertNotIn("pinned", json.dumps(manifest))
+
+
+@unittest.skipUnless(HAS_YAML, "PyYAML reads the workflow")
+class PublishWorkflowTests(unittest.TestCase):
+    """The publish workflow's steps around the generator."""
+
+    def setUp(self):
+        import yaml
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / ".github/workflows/publish.yml").read_text())
+        self.steps = workflow["jobs"]["bundle"]["steps"]
+
+    def step(self, prefix):
+        return next(step for step in self.steps if step.get("name", "").startswith(prefix))
+
+    def test_the_build_resolves_each_pinned_tag_to_a_digest_before_the_generator_runs(self):
+        run = self.step("Version, build and tag")["run"]
+        for part in ("release.py pins --repo . --commit \"$COMMIT\"",
+                     "docker buildx imagetools inspect \"$reference\" --format '{{json .Manifest}}'",
+                     "jq -re .digest", "arguments+=(--pin \"$service=$digest\")", "::error title=pinned image::"):
+            self.assertIn(part, run)
+        self.assertLess(run.index("imagetools"), run.index('release.py "${arguments[@]}"'))
+
+
 class PlanTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -999,9 +1150,9 @@ class CiTests(unittest.TestCase):
         self.caches.append(cache)
         return repository + "@sha256:" + hashlib.sha256((name + tag).encode()).hexdigest()
 
-    def run_ci(self, branch, base=None, cache=None):
+    def run_ci(self, branch, base=None, cache=None, pins=None):
         arguments = argparse.Namespace(repo=str(self.repo), branch=branch, main="main", registry="ghcr.io/o/pilot",
-                                       output="bundle", rollback_compatible=False, cache=cache)
+                                       output="bundle", rollback_compatible=False, cache=cache, pin=pins)
         with contextlib.redirect_stdout(io.StringIO()) as printed, contextlib.redirect_stderr(io.StringIO()) as logged:
             release.ci(arguments, self.commit, self.descriptor, base)
         self.logged = logged.getvalue()
@@ -1061,6 +1212,22 @@ class CiTests(unittest.TestCase):
         self.caches.clear()
         self.run_ci("main", cache="gha")
         self.assertEqual(["gha", "gha"], self.caches)
+
+    def test_a_pinned_image_is_never_built_or_retagged_and_takes_its_resolved_digest(self):
+        self.descriptor = release.validate(with_pinned())
+        with self.assertRaisesRegex(release.Invalid, "identity: pass the digest"):
+            self.run_ci("main")
+        self.assertEqual([], self.built)
+        result, outputs = self.run_ci("main", pins=["identity=" + PIN])
+        self.assertEqual("built", outputs["status"])
+        self.assertEqual({"api", "edge"}, {name for name, _, _, _ in self.built})
+        self.assertEqual({("ghcr.io/o/pilot/api", "latest"), ("ghcr.io/o/pilot/edge", "latest")},
+                         {(image.split("@", 1)[0], tag) for image, tag in self.moved})
+        manifest = json.loads(Path(self.temporary.name, "bundle", "release.json").read_text())
+        self.assertEqual(IDENTITY + "@" + PIN, manifest["images"]["identity"])
+        self.assertEqual({"version": "0.3.0", "changedIn": "v0.4.0"}, manifest["versions"]["identity"])
+        compose = json.loads(Path(self.temporary.name, "bundle", "compose.json").read_text())
+        self.assertEqual(IDENTITY + "@" + PIN, compose["services"]["identity"]["image"])
 
     def test_a_push_that_changes_nothing_is_skipped(self):
         base = {"product": "pilot", "release": "v0.4.0", "sourceCommit": self.commit,

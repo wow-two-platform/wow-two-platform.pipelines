@@ -153,13 +153,51 @@ a list of lines, run with `bash -eo pipefail`.
   one line without control characters or leading or trailing space: names 1–80 characters, descriptions 1–200. The
   generator checks them and leaves them out of the bundle, which stays byte for byte the same; Wheelhouse reads them
   from the repository in place of the retired `product/product.json`. An older tag refuses the keys.
-- From `v0.12.0` a descriptor may declare the migrate step (`migrate`) and the untrusted PostgreSQL extensions its sets
-  need (`extensions`) — [below](#migrations-pinned-images-and-extensions). An older tag refuses each key.
+- From `v0.12.0` a descriptor may declare the migrate step (`migrate`), the untrusted PostgreSQL extensions its sets
+  need (`extensions`) and services that run another repository's image pinned by its release tag —
+  [below](#migrations-pinned-images-and-extensions). An older tag refuses each.
 
 ## Migrations, pinned images and extensions
 
-Rules: `wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md` § *Migrate*. Each key reaches `release.json`
-only when declared, so a descriptor without them builds its bundle byte for byte as `v0.11.0` did.
+Rules: `wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md` § *Migrate* and § *Pinned images*. Each
+reaches the bundle only when declared, so a descriptor without them builds its bundle byte for byte as `v0.11.0` did.
+
+### Pinned images
+
+```yaml
+services:
+  identity:                           # a per-product Identity instance
+    image: ghcr.io/wow-two-sdk-beta/wow-two-sdk-beta.identity/identity:0.3.0
+    health: /health
+    needs: [postgres]
+```
+
+- A service without `build` is pinned: its `image` names a repository and a release tag (`[A-Za-z0-9_][A-Za-z0-9_.-]*`,
+  at most 128 characters). The generator refuses `latest`, an image without a tag or with a digest, `paths` on a pinned
+  image, and a tagged image beside `build`; a built service's `image` stays a repository without a tag.
+- It never builds and no path rebuilds it. Its tag changes only in `deploy.yml`, so a new tag is a descriptor change
+  and releases a new bundle; every other key (health, settings, volumes, sites, `needs`, `dependsOn`) works as for any
+  service.
+- At every build, publish runs `release.py pins` (service → `<repository>:<tag>`), resolves each tag with
+  `docker buildx imagetools inspect <repository>:<tag> --format '{{json .Manifest}}'` and passes the manifest's
+  `digest` as `--pin <service>=sha256:<digest>`. A tag that does not resolve fails the build with
+  `::error title=pinned image::`; the image must be public, since the workflow's token reads only the product's own
+  packages. The digest is that of the tag's top-level manifest: the multi-platform index when there is one.
+- Publish never retags it: `latest` moves on the product's own images only.
+
+Where the pin appears, for the identity example above built into release `v1.4.0` with digest `sha256:<d>`:
+
+| Place | Value |
+|---|---|
+| `compose.json` `services.identity.image` | `ghcr.io/wow-two-sdk-beta/wow-two-sdk-beta.identity/identity@sha256:<d>`: the digest, never the tag |
+| `release.json` `images.identity` | the same `<repository>@sha256:<d>` |
+| `release.json` `versions.identity.version` | `0.3.0`: the tag, verbatim (a tag `v0.3.0` stays `v0.3.0`) |
+| `release.json` `versions.identity.changedIn` | the release that first carried this tag: `v1.4.0`, or a base release's value while the tag and repository stay the same |
+
+No other `release.json` key marks a pinned service: the tag lives only in `versions.<service>.version`, and the
+repository is `images.<service>` before the `@`.
+
+### Migrate and extensions
 
 ```yaml
 migrate:                              # one item per image that hosts a migration set
@@ -194,6 +232,7 @@ extensions: [postgres_fdw]            # untrusted extensions only; a set creates
 ## Running the generator locally
 
 ```bash
+python3 generator/release.py pins --repo <product> --commit HEAD   # the pinned images to resolve, as JSON
 python3 generator/release.py plan --repo <product> --commit HEAD
 python3 generator/release.py notes --repo <product> --commit HEAD --previous v0.4.2
 python3 -B -m unittest -v test_release test_ci_plan   # from generator/

@@ -106,6 +106,17 @@ jobs:
           arguments=(ci --repo . --commit "$COMMIT" --main "${{ inputs.main-branch }}"
                      --registry "ghcr.io/${GITHUB_REPOSITORY,,}" --output bundle --cache gha)
           [ -n "$BRANCH" ] && arguments+=(--branch "$BRANCH")
+          # A pinned image (another repository's image at a release tag) never builds: its tag resolves to the digest
+          # the bundle pins, at every build.
+          pins=$(python3 .pipelines/generator/release.py pins --repo . --commit "$COMMIT")
+          while IFS=$'\t' read -r service reference; do
+            if ! digest=$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' < /dev/null | jq -re .digest); then
+              echo "::error title=pinned image::$service: $reference resolves to no digest; publish that tag, or make the image public" >&2
+              exit 1
+            fi
+            echo "$service: $reference is $digest"
+            arguments+=(--pin "$service=$digest")
+          done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$pins")
           python3 .pipelines/generator/release.py "${arguments[@]}" ${BASE_ARGUMENTS:-}
       - name: Publish the release with its notes
         # The body: the commits since the previous release (release.py notes), then GitHub's generated notes — the

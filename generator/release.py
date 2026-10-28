@@ -7,7 +7,9 @@ build; any other branch, or a dispatched commit, builds a candidate. Only servic
 the base release rebuild; the rest keep the base release's image and version, so each service carries the version in
 which it last changed. A base whose source commit is not in the repository's history (an author rewrite removed it) is
 not used: every service rebuilds and the build warns. Descriptor 2 declares the product's sites at the top and the paths each service serves per site;
-descriptor 1 (one path per service site) still reads and keeps its bundles byte for byte.
+descriptor 1 (one path per service site) still reads and keeps its bundles byte for byte. A service without `build`
+runs another repository's image pinned by its release tag: it never builds, carries its tag as its version, and the
+bundle pins the digest the workflow resolved the tag to (`pins`, then `--pin`).
 Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md.
 Requires Python 3.9+, Git and, for `build` / `ci`, Docker with Buildx; the descriptor parser needs PyYAML.
 """
@@ -75,6 +77,10 @@ VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
 MIGRATE_TIMEOUT, MIGRATE_TIMEOUT_LIMIT = 600, 3600
 # An untrusted PostgreSQL extension Wheelhouse creates as superuser when it places the product's database.
 EXTENSION = re.compile(r"[a-z][a-z0-9_-]{0,62}")
+# A pinned image's release tag, after the colon in its last path segment; `latest` is refused. The workflow resolves it
+# to a digest, which the bundle pins.
+IMAGE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+IMAGE_DIGEST = re.compile(r"sha256:[a-f0-9]{64}")
 
 
 class Invalid(ValueError):
@@ -303,8 +309,25 @@ def dependency_order(services):
     return order
 
 
-def service_of(name, service, claimed, roles=None):
-    build = service.get("build")
+def pinned_image(name, service):
+    """A service without `build` runs another repository's published image pinned by its release tag: (repository,
+    tag). It never builds, so it takes no `paths`; `latest` and an image without a tag are refused."""
+    image = service.get("image")
+    check(image is not None, name + ": a service needs build, or an image pinned by its release tag")
+    check("paths" not in service, name + ": a pinned image never builds, so it takes no paths")
+    check(isinstance(image, str) and "@" not in image and ":" in image.rsplit("/", 1)[-1],
+          name + ": a pinned image needs a release tag, such as ghcr.io/owner/repo/service:1.2.0")
+    repository, tag = image.rsplit(":", 1)
+    check(REPOSITORY.fullmatch(repository) and IMAGE_TAG.fullmatch(tag),
+          name + ": image must be a lowercase repository and a release tag, such as ghcr.io/owner/repo/service:1.2.0")
+    check(tag != "latest", name + ": a pinned image needs a release tag, never latest")
+    return repository, tag
+
+
+def built_image(name, service):
+    """A service built from this repository: its checked `build` and the `paths` that change it, and `image`, a legacy
+    repository name without a tag (a tagged image is pinned and takes no build)."""
+    build = service["build"]
     check(isinstance(build, dict) and set(build) <= {"dockerfile", "context", "target", "args", "contexts"},
           name + ": build takes dockerfile, context, target, args and contexts")
     args, contexts = build.get("args") or {}, build.get("contexts") or {}
@@ -315,6 +338,26 @@ def service_of(name, service, claimed, roles=None):
     check(build.get("target") is None or isinstance(build["target"], str), name + ": build target must be a stage name")
     paths = service.get("paths")
     check(isinstance(paths, list) and paths, name + ": paths must list what changes the service")
+    image = service.get("image")
+    # A registry port may carry a colon; the last path segment may not, or it would be a tag.
+    check(image is None or (isinstance(image, str) and REPOSITORY.fullmatch(image) and "@" not in image
+                            and ":" not in image.rsplit("/", 1)[-1]),
+          name + ": with build, image must be a repository without a tag; a tagged image is pinned and takes no build")
+    return {"image": image,
+            "build": {"dockerfile": relative(build.get("dockerfile"), name + ": build dockerfile"),
+                      "context": relative(build.get("context", "codebase"), name + ": build context"),
+                      "target": build.get("target"), "args": {key: str(value) for key, value in args.items()},
+                      "contexts": {key: relative(path, name + ": build context " + key) for key, path in contexts.items()}},
+            "paths": [relative(path, name + ": path") for path in paths]}
+
+
+def service_of(name, service, claimed, roles=None):
+    if "build" in service:
+        result = built_image(name, service)
+    else:
+        repository, tag = pinned_image(name, service)
+        # Only a pinned service carries `pinned`, so a descriptor without one validates as before.
+        result = {"image": repository, "build": None, "paths": [], "pinned": tag}
     port = service.get("port", 8080)
     check(type(port) is int and 1 <= port <= 65535, name + ": port must be 1-65535")
     health = service.get("health")
@@ -390,18 +433,8 @@ def service_of(name, service, claimed, roles=None):
     capabilities = service.get("capabilities") or []
     check(isinstance(capabilities, list) and all(isinstance(item, str) and CAPABILITY.fullmatch(item) for item in capabilities),
           name + ": capabilities must be Linux capability names")
-    image = service.get("image")
-    # A registry port may carry a colon; the last path segment may not, or it would be a tag.
-    check(image is None or (isinstance(image, str) and REPOSITORY.fullmatch(image) and "@" not in image
-                            and ":" not in image.rsplit("/", 1)[-1]), name + ": image must be a repository without a tag")
-    return {"image": image,
-            "build": {"dockerfile": relative(build.get("dockerfile"), name + ": build dockerfile"),
-                      "context": relative(build.get("context", "codebase"), name + ": build context"),
-                      "target": build.get("target"), "args": {key: str(value) for key, value in args.items()},
-                      "contexts": {key: relative(path, name + ": build context " + key) for key, path in contexts.items()}},
-            "paths": [relative(path, name + ": path") for path in paths], "port": port, "health": test,
-            "memory": memory, "stopGrace": grace, "settings": settings, "volumes": volumes, "sites": sites,
-            "needs": needs, "capabilities": capabilities, "dependsOn": depends}
+    return {**result, "port": port, "health": test, "memory": memory, "stopGrace": grace, "settings": settings,
+            "volumes": volumes, "sites": sites, "needs": needs, "capabilities": capabilities, "dependsOn": depends}
 
 
 def setting_keys(name, declared):
@@ -580,7 +613,10 @@ def glob(pattern):
 
 
 def triggers(descriptor, name):
+    """The paths whose change rebuilds the service; none for a pinned image, which changes only with its tag."""
     service = descriptor["services"][name]
+    if service.get("pinned"):
+        return []
     return [glob(path) for path in [*service["paths"], *descriptor["shared"], service["build"]["dockerfile"]]]
 
 
@@ -658,18 +694,22 @@ def plan(descriptor, repo, commit, base=None, tag=None, version=None):
             carried = None
             warning = ("Base " + str(base["release"]) + "'s source commit (" + str(base.get("sourceCommit"))[:7]
                        + ") is not in this history; every service was rebuilt.")
+    # A pinned image is another repository's release: it never builds here.
+    buildable = [name for name, service in descriptor["services"].items() if not service.get("pinned")]
     if carried is None:
-        rebuild = list(descriptor["services"])
+        rebuild = buildable
     else:
         rebuild = changed_services(descriptor, paths)
         descriptor_changed = DESCRIPTOR in paths
         # A service the base release never shipped has no image to keep.
-        rebuild += [name for name in descriptor["services"] if name not in base["images"] and name not in rebuild]
+        rebuild += [name for name in buildable if name not in base["images"] and name not in rebuild]
     label = tag or "sha-" + short
     base_version = TAG.fullmatch(base["release"]) and base["release"][1:] if base else None
     services = {}
-    for name in descriptor["services"]:
-        if name in rebuild:
+    for name, service in descriptor["services"].items():
+        if service.get("pinned"):
+            services[name] = pinned_plan(name, service, carried, label)
+        elif name in rebuild:
             built = version or (tag[1:] if tag else (base_version or "0.0.0") + "+" + short)
             services[name] = {"build": True, "version": built, "changedIn": label}
         else:
@@ -683,6 +723,36 @@ def plan(descriptor, repo, commit, base=None, tag=None, version=None):
     if warning:
         planned["warning"] = warning
     return planned
+
+
+def pinned_plan(name, service, base, label):
+    """A pinned image's plan entry: versioned by its tag, changed in the release that set the tag, never built. Its
+    digest comes from the workflow (`--pin`), which resolves the tag at each build."""
+    previous = ((base or {}).get("versions") or {}).get(name)
+    image = ((base or {}).get("images") or {}).get(name)
+    kept = (isinstance(previous, dict) and previous.get("version") == service["pinned"]
+            and isinstance(previous.get("changedIn"), str)
+            and isinstance(image, str) and image.split("@", 1)[0] == service["image"])
+    return {"build": False, "version": service["pinned"], "changedIn": previous["changedIn"] if kept else label,
+            "pinned": service["image"] + ":" + service["pinned"]}
+
+
+def pinned_images(descriptor, pins):
+    """Each pinned service's image by digest, `<repository>@sha256:<digest>`, from the digest the workflow resolved its
+    tag to (`--pin <service>=sha256:<digest>`); refuses a pinned service without one and a pin for any other service."""
+    pinned = {name: service for name, service in descriptor["services"].items() if service.get("pinned")}
+    pins = pins or {}
+    stray = sorted(set(pins) - set(pinned))
+    check(not stray, "--pin names a service without a pinned image: " + ", ".join(stray))
+    images = {}
+    for name, service in pinned.items():
+        reference = service["image"] + ":" + service["pinned"]
+        check(name in pins, name + ": pass the digest " + reference + " resolves to, as --pin " + name
+              + "=sha256:<digest>")
+        check(isinstance(pins[name], str) and IMAGE_DIGEST.fullmatch(pins[name]),
+              name + ": --pin takes sha256: and 64 lowercase hex digits")
+        images[name] = service["image"] + "@" + pins[name]
+    return images
 
 
 def announce(planned):
@@ -908,9 +978,13 @@ def move_tag(image, tag):
     docker("buildx", "imagetools", "create", "--tag", repository + ":" + tag, image)
 
 
-def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=None, app_version=None, cache=None):
-    """Builds and pushes every planned service; returns each service's digest-pinned image."""
-    images = {name: entry["image"] for name, entry in planned["services"].items() if not entry["build"]}
+def build(descriptor, planned, repo, registry, local_images, checkout=None, tag=None, app_version=None, cache=None,
+          pins=None):
+    """Builds and pushes every planned service; returns each service's digest-pinned image. A pinned service takes the
+    digest its tag resolved to (`pins`), checked before anything builds."""
+    images = pinned_images(descriptor, pins)
+    images.update({name: entry["image"] for name, entry in planned["services"].items()
+                   if not entry["build"] and name not in images})
     tag = tag or (planned["release"][1:] if planned["kind"] == "release" else planned["release"])
     pending = [name for name, entry in planned["services"].items() if entry["build"]]
     worktree = None
@@ -970,6 +1044,22 @@ def load(repo, commit, descriptor_path=None):
     return validate(parse(text))
 
 
+def pin_arguments(values):
+    """`--pin SERVICE=sha256:<digest>` arguments as a mapping; a service named twice is refused."""
+    pins = {}
+    for value in values or []:
+        service, separator, digest = value.partition("=")
+        check(separator and service not in pins, "--pin takes SERVICE=sha256:<digest>, once per service")
+        pins[service] = digest
+    return pins
+
+
+def pins_of(descriptor):
+    """The pinned images the workflow resolves to digests before a build: service → `<repository>:<tag>`."""
+    return {name: service["image"] + ":" + service["pinned"]
+            for name, service in descriptor["services"].items() if service.get("pinned")}
+
+
 def warned(descriptor):
     """Prints each warning as a GitHub Actions annotation on stderr, leaving stdout to the action's result. `validate`
     prints them, once per build: the publish workflow runs it first."""
@@ -980,7 +1070,7 @@ def warned(descriptor):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=["validate", "plan", "build", "ci", "notes"])
+    parser.add_argument("action", choices=["validate", "plan", "build", "ci", "notes", "pins"])
     parser.add_argument("--repo", default=".", help="the product repository")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--descriptor", help="a deploy.yml on disk instead of the one at the commit")
@@ -992,6 +1082,8 @@ def main():
     parser.add_argument("--registry", help="image prefix, e.g. ghcr.io/owner/repo; each service is <prefix>/<name>")
     parser.add_argument("--image", action="append", default=[], metavar="SERVICE=REF",
                         help="publish an image that already exists locally instead of building the service")
+    parser.add_argument("--pin", action="append", default=[], metavar="SERVICE=sha256:DIGEST",
+                        help="build, ci: the digest a pinned service's tag resolves to (`pins` lists them)")
     parser.add_argument("--checkout", action="store_true", help="build from --repo as checked out (CI)")
     parser.add_argument("--rollback-compatible", action="store_true")
     parser.add_argument("--output", help="bundle folder to write")
@@ -1010,6 +1102,9 @@ def main():
             sys.stdout.write(release_notes(args.repo, commit, args.previous or None, args.warning or None))
             return 0
         descriptor = load(args.repo, commit, args.descriptor)
+        if args.action == "pins":
+            print(json.dumps(pins_of(descriptor)))
+            return 0
         if args.platform:
             descriptor["platform"] = args.platform
         base = json.loads((Path(args.base) / "release.json").read_text()) if args.base else None
@@ -1022,9 +1117,10 @@ def main():
             return 0
         check(args.registry and args.output, "build needs --registry and --output")
         local_images = dict(item.split("=", 1) for item in args.image)
-        check(set(local_images) <= set(descriptor["services"]), "--image names an unknown service")
+        check(set(local_images) <= {name for name, service in descriptor["services"].items() if not service.get("pinned")},
+              "--image names an unknown or pinned service")
         images = build(descriptor, planned, args.repo, args.registry, local_images, args.repo if args.checkout else None,
-                       cache=args.cache)
+                       cache=args.cache, pins=pin_arguments(args.pin))
         compose_bytes, manifest = render(descriptor, planned, images, args.branch, args.rollback_compatible)
         write_bundle(args.output, compose_bytes, manifest, args.archive)
         print(json.dumps({"release": manifest["release"], "kind": manifest["kind"], "output": args.output,
@@ -1053,10 +1149,12 @@ def ci(args, commit, descriptor, base):
         result.update(status="skipped", archive="")
     else:
         images = build(descriptor, planned, args.repo, args.registry, {}, args.repo, identity["tag"],
-                       identity["version"], getattr(args, "cache", None))
+                       identity["version"], getattr(args, "cache", None), pin_arguments(getattr(args, "pin", None)))
         if identity["moving"]:
-            for image in images.values():
-                move_tag(image, identity["moving"])
+            # A pinned image belongs to another repository, whose tags stay its own.
+            for name, image in images.items():
+                if not descriptor["services"][name].get("pinned"):
+                    move_tag(image, identity["moving"])
         compose_bytes, manifest = render(descriptor, planned, images, args.branch or None, args.rollback_compatible,
                                          identity)
         archive = descriptor["product"] + "-release.tar.gz" if identity["kind"] == "release" else ""

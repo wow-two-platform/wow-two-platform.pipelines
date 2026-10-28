@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 import unittest.mock
@@ -516,6 +518,120 @@ extensions: [postgres_fdw]            # untrusted extensions only; a set creates
         self.assertEqual(["postgres_fdw"], descriptor["extensions"])
 
 
+SETS = [{"name": "pilot", "schema": "public", "strategy": "bespoke", "level": 3,
+         "contracts": [{"label": "003-drop-legacy", "since": "v0.4"}], "dependsOn": [{"set": "identity", "level": 2}],
+         "extensions": ["pg_trgm"], "package": "Pilot.Api", "version": "1.0.0"},
+        {"name": "outbox", "schema": "outbox", "strategy": "bespoke", "ownerKind": "module", "level": 1}]
+RESULT = 'migrate-result {"verb":"sets","exit":0,"sets":[{"name":"pilot","state":"current","levelAfter":3}]}'
+
+
+def sets_output(sets, result=RESULT, indent=None):
+    """What an image prints for `migrate sets --json`: the JSON report, then the migrate-result line last."""
+    return json.dumps({"sets": sets}, indent=indent) + "\n" + result + "\n"
+
+
+class MigrationSetsTests(unittest.TestCase):
+    """`release.py sets`: what each migrate item's image hosts, read from its `migrate sets --json` output."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["migrate"] = copy.deepcopy(MIGRATE)
+        release_bytes, compose_bytes = fixed_bundle(release.validate(declared))
+        self.archive = self.root / "pilot-release.tar.gz"
+        release.write_bundle(self.root / "bundle", compose_bytes, json.loads(release_bytes), self.archive)
+        self.reports = self.root / "reports"
+        self.reports.mkdir()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def report(self, service, text):
+        (self.reports / (service + ".out")).write_text(text)
+
+    def test_migration_sets_list_each_items_sets_verbatim_with_their_levels(self):
+        self.report("api", sets_output(SETS))
+        self.report("edge", sets_output(SETS[1:], indent=2))
+        compose_before = (self.root / "bundle" / "compose.json").read_bytes()
+        manifest = release.record_sets(self.root / "bundle", self.reports, self.archive)
+        written = json.loads((self.root / "bundle" / "release.json").read_text())
+        self.assertEqual(manifest, written)
+        self.assertIs(True, written["migrations"])
+        self.assertEqual({"api": SETS, "edge": SETS[1:]}, written["migrationSets"])
+        self.assertEqual(["api", "edge"], list(written["migrationSets"]))
+        self.assertEqual(("pilot", 3), (written["migrationSets"]["api"][0]["name"], written["migrationSets"]["api"][0]["level"]))
+        self.assertEqual(["migrate", "migrations", "migrationSets"],
+                         [key for key in written if key.startswith("migrat")])
+        self.assertEqual(compose_before, (self.root / "bundle" / "compose.json").read_bytes())
+        with tarfile.open(self.archive) as package:
+            self.assertEqual(["release.json", "compose.json"], package.getnames())
+            self.assertEqual((self.root / "bundle" / "release.json").read_bytes(),
+                             package.extractfile("release.json").read())
+
+    def test_a_candidate_bundle_without_an_archive_is_rewritten_in_place(self):
+        for service in ("api", "edge"):
+            self.report(service, sets_output(SETS[:1]))
+        self.archive.unlink()
+        release.record_sets(self.root / "bundle", self.reports)
+        self.assertFalse(self.archive.exists())
+        self.assertEqual(SETS[:1], json.loads((self.root / "bundle" / "release.json").read_text())["migrationSets"]["edge"])
+
+    def test_output_that_is_not_a_sets_report_fails_the_release(self):
+        cases = (
+            (json.dumps({"sets": SETS}) + "\n", "api: migrate sets --json printed no migrate-result line last"),
+            ("", "printed no migrate-result line last"),
+            (RESULT + "\n", "api: migrate sets --json printed no JSON report before its migrate-result line"),
+            ("Unhandled exception\n" + RESULT, "printed no JSON report"),
+            ("starting\n" + sets_output(SETS), "printed no JSON report"),
+            (sets_output(SETS, 'migrate-result {"verb":"sets","exit":1}'), "api: migrate sets --json reported exit 1"),
+            (sets_output([]), "api: migrate sets --json lists no set"),
+            ("[]\n" + RESULT, "lists no set"),
+            (json.dumps({"report": SETS}) + "\n" + RESULT, "lists no set"),
+            (sets_output([{"name": "pilot"}]), "api: every set migrate sets --json lists needs a name and a level"),
+            (sets_output([{"name": "", "level": 1}]), "needs a name and a level"),
+            (sets_output([{"name": "pilot", "level": "3"}]), "needs a name and a level"),
+            (sets_output([{"name": "pilot", "level": -1}]), "needs a name and a level"),
+        )
+        self.report("edge", sets_output(SETS[1:]))
+        for text, message in cases:
+            with self.subTest(message=message, text=text[:40]):
+                self.report("api", text)
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.record_sets(self.root / "bundle", self.reports, self.archive)
+
+    def test_a_malformed_result_line_and_blank_trailing_lines_are_tolerated(self):
+        self.assertEqual(SETS, release.sets_report("api", sets_output(SETS, "migrate-result {not json") + "\n\n"))
+
+    def test_a_missing_report_or_a_bundle_without_migrate_items_is_refused(self):
+        self.report("api", sets_output(SETS))
+        with self.assertRaisesRegex(release.Invalid, "edge: no migrate sets --json output at .*edge.out"):
+            release.record_sets(self.root / "bundle", self.reports)
+        plain = self.root / "plain"
+        release_bytes, compose_bytes = fixed_bundle(release.validate(copy.deepcopy(DESCRIPTOR)))
+        release.write_bundle(plain, compose_bytes, json.loads(release_bytes))
+        with self.assertRaisesRegex(release.Invalid, "The bundle declares no migrate items"):
+            release.record_sets(plain, self.reports)
+
+    def test_the_command_line_records_the_sets_and_reports_a_refusal(self):
+        self.report("api", sets_output(SETS))
+        script = str(Path(release.__file__).resolve())
+        missing = subprocess.run([sys.executable, "-B", script, "sets", "--output", str(self.root / "bundle"),
+                                  "--sets", str(self.reports)], capture_output=True, text=True)
+        self.assertEqual(1, missing.returncode)
+        self.assertEqual("rejected", json.loads(missing.stderr)["status"])
+        self.assertIn("edge: no migrate sets --json output", json.loads(missing.stderr)["reason"])
+        self.report("edge", sets_output(SETS[1:]))
+        done = subprocess.run([sys.executable, "-B", script, "sets", "--output", str(self.root / "bundle"),
+                               "--sets", str(self.reports), "--archive", str(self.archive)],
+                              capture_output=True, text=True)
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual({"migrations": True, "sets": {"api": [{"name": "pilot", "level": 3},
+                                                               {"name": "outbox", "level": 1}],
+                                                       "edge": [{"name": "outbox", "level": 1}]}},
+                         json.loads(done.stdout))
+
+
 IDENTITY = "ghcr.io/wow-two-sdk-beta/wow-two-sdk-beta.identity/identity"
 PIN = "sha256:" + "d" * 64
 
@@ -665,6 +781,23 @@ class PublishWorkflowTests(unittest.TestCase):
                      "jq -re .digest", "arguments+=(--pin \"$service=$digest\")", "::error title=pinned image::"):
             self.assertIn(part, run)
         self.assertLess(run.index("imagetools"), run.index('release.py "${arguments[@]}"'))
+
+    def test_each_migrate_items_image_runs_offline_before_the_bundle_is_published(self):
+        record = self.step("Record the sets")
+        self.assertEqual("steps.build.outputs.status == 'built'", record["if"])
+        self.assertEqual("${{ steps.build.outputs.archive }}", record["env"]["ARCHIVE"])
+        run = record["run"]
+        for part in ("jq 'has(\"migrate\")' bundle/release.json", "docker run --rm --network none --cap-drop ALL",
+                     "--entrypoint \"${command[0]}\" \"$image\" \"${command[@]:1}\" sets --json",
+                     "> \"$reports/$service.out\"", "::error title=migrate sets::", "timeout 600 docker run",
+                     "arguments=(sets --output bundle --sets \"$reports\")", "arguments+=(--archive \"$ARCHIVE\")"):
+            self.assertIn(part, run)
+        self.assertLess(run.index("exit 0"), run.index("docker run"))
+        names = [step.get("name", "") for step in self.steps]
+        record_at = names.index(record["name"])
+        self.assertEqual(names.index(self.step("Version, build and tag")["name"]) + 1, record_at)
+        self.assertLess(record_at, names.index(self.step("Publish the release")["name"]))
+        self.assertLess(record_at, names.index(self.step("Upload the build's bundle")["name"]))
 
 
 class PlanTests(unittest.TestCase):

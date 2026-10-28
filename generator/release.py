@@ -77,6 +77,8 @@ VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
 MIGRATE_TIMEOUT, MIGRATE_TIMEOUT_LIMIT = 600, 3600
 # An untrusted PostgreSQL extension Wheelhouse creates as superuser when it places the product's database.
 EXTENSION = re.compile(r"[a-z][a-z0-9_-]{0,62}")
+# The be sdk's migrate verbs end their stdout with this line; `sets --json` prints its JSON report before it.
+RESULT_LINE = "migrate-result "
 # A pinned image's release tag, after the colon in its last path segment; `latest` is refused. The workflow resolves it
 # to a digest, which the bundle pins.
 IMAGE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
@@ -888,7 +890,8 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
     if descriptor.get("verify"):
         manifest["verify"] = descriptor["verify"]
     # The migrate step's items, in the descriptor's order, and the untrusted extensions placement creates; each only
-    # when declared, so every other bundle stays byte for byte the same.
+    # when declared, so every other bundle stays byte for byte the same. `release.py sets` adds what each item's image
+    # hosts (`migrations`, `migrationSets`) once the images exist.
     if "migrate" in descriptor:
         manifest["migrate"] = descriptor["migrate"]
     if "extensions" in descriptor:
@@ -898,6 +901,55 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
     if identity:
         manifest["version"], manifest["channel"] = identity["version"], identity["channel"]
     return compose_bytes, manifest
+
+
+def sets_report(service, text):
+    """The `sets` array of one image's `migrate sets --json` run, each set as the image described it (name, schema,
+    level, contracts, dependencies, extensions, package). Its stdout holds the JSON report, then the `migrate-result
+    {json}` line last; the report is read, the result line only checked."""
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    check(lines and lines[-1].startswith(RESULT_LINE), service + ": migrate sets --json printed no migrate-result line "
+          "last; the command must end in the be sdk's bare migrate verb")
+    try:
+        result = json.loads(lines[-1][len(RESULT_LINE):])
+    except ValueError:
+        result = None
+    # A malformed result line is tolerated: the process's own exit, which the workflow checks, is the verdict.
+    exit_code = result.get("exit", 0) if isinstance(result, dict) else 0
+    check(exit_code == 0, service + ": migrate sets --json reported exit " + str(exit_code))
+    try:
+        report = json.loads("\n".join(lines[:-1]))
+    except ValueError:
+        raise Invalid(service + ": migrate sets --json printed no JSON report before its migrate-result line") from None
+    sets = report.get("sets") if isinstance(report, dict) else None
+    check(isinstance(sets, list) and sets, service + ": migrate sets --json lists no set; a migrate item names an image "
+          "that hosts one")
+    check(all(isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]
+              and type(entry.get("level")) is int and entry["level"] >= 0 for entry in sets),
+          service + ": every set migrate sets --json lists needs a name and a level")
+    return sets
+
+
+def record_sets(output, reports, archive=None):
+    """Adds what each migrate item's image hosts to a written bundle and rewrites it (and its archive, for a release):
+    `migrationSets` holds, per item's service in the items' order, every set its image's `migrate sets --json` listed,
+    verbatim; `migrations` is true once they list a set, the fact Wheelhouse's runner reads. `reports` is the folder
+    holding each item's stdout as `<service>.out`."""
+    output = Path(output)
+    manifest = json.loads((output / "release.json").read_text())
+    items = manifest.get("migrate")
+    check(isinstance(items, list) and items, "The bundle declares no migrate items")
+    sets = {}
+    for item in items:
+        path = Path(reports) / (item["service"] + ".out")
+        check(path.is_file(), item["service"] + ": no migrate sets --json output at " + str(path))
+        sets[item["service"]] = sets_report(item["service"], path.read_bytes().decode("utf-8", "replace"))
+    manifest["migrations"] = any(sets.values())
+    manifest["migrationSets"] = sets
+    write_bundle(output, (output / "compose.json").read_bytes(), manifest, archive)
+    return manifest
 
 
 def write_bundle(output, compose_bytes, manifest, archive=None):
@@ -1070,7 +1122,7 @@ def warned(descriptor):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=["validate", "plan", "build", "ci", "notes", "pins"])
+    parser.add_argument("action", choices=["validate", "plan", "build", "ci", "notes", "pins", "sets"])
     parser.add_argument("--repo", default=".", help="the product repository")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--descriptor", help="a deploy.yml on disk instead of the one at the commit")
@@ -1091,8 +1143,17 @@ def main():
     parser.add_argument("--previous", help="notes: the previous release's tag; the notes list the commits since it")
     parser.add_argument("--warning", help="notes: a line the notes lead with, the build's base warning")
     parser.add_argument("--cache", choices=["gha"], help="build, ci: read and write image layers in this cache")
+    parser.add_argument("--sets", help="sets: the folder holding each migrate item's `sets --json` stdout as "
+                                       "<service>.out; the bundle in --output (and --archive) gains migrationSets")
     args = parser.parse_args()
     try:
+        if args.action == "sets":
+            check(args.output and args.sets, "sets needs --output and --sets")
+            manifest = record_sets(args.output, args.sets, args.archive)
+            print(json.dumps({"migrations": manifest["migrations"], "sets": {
+                service: [{"name": entry["name"], "level": entry["level"]} for entry in entries]
+                for service, entries in manifest["migrationSets"].items()}}))
+            return 0
         if args.action == "validate":
             descriptor = warned(validate(parse(Path(args.descriptor or Path(args.repo) / DESCRIPTOR).read_text())))
             print(json.dumps({"product": descriptor["product"], "services": sorted(descriptor["services"])}))

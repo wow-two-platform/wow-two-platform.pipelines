@@ -7,6 +7,8 @@
 # A previous release whose source commit is not in the checked-out history (an author rewrite removed it) is not used
 # as the base: every service rebuilds, and the job log and the release notes say so.
 # Image layers go through the GitHub Actions cache, one scope per service, so unchanged stages are not rebuilt.
+# A pinned image (another repository's image at a release tag) never builds: its tag resolves to a digest at every
+# build. A bundle that declares migrate items records the sets each item's image hosts, run offline (`sets --json`).
 # delivery.yml calls it after ci; a product may still call it directly.
 # Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md § Builds and versions.
 name: publish
@@ -118,6 +120,40 @@ jobs:
             arguments+=(--pin "$service=$digest")
           done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$pins")
           python3 .pipelines/generator/release.py "${arguments[@]}" ${BASE_ARGUMENTS:-}
+      - name: Record the sets each migrate item's image hosts
+        # Only for a bundle that declares migrate items. Each item's release image runs offline as
+        # `<command> sets --json`, its command's first part the entrypoint, exactly as the runner will run `<command>`;
+        # release.py sets reads the JSON report before the migrate-result line and writes migrationSets.
+        if: steps.build.outputs.status == 'built'
+        env:
+          ARCHIVE: ${{ steps.build.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if [ "$(jq 'has("migrate")' bundle/release.json)" != true ]; then
+            exit 0
+          fi
+          reports="$RUNNER_TEMP/migrate-sets"
+          mkdir -p "$reports"
+          platform=$(jq -r .platform bundle/release.json)
+          count=$(jq '.migrate | length' bundle/release.json)
+          for ((index = 0; index < count; index++)); do
+            service=$(jq -r --argjson index "$index" '.migrate[$index].service' bundle/release.json)
+            image=$(jq -r --arg service "$service" '.images[$service]' bundle/release.json)
+            mapfile -d '' command < <(jq -j --argjson index "$index" '.migrate[$index].command[] | . + "\u0000"' bundle/release.json)
+            status=0
+            timeout 600 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+              --platform "$platform" --entrypoint "${command[0]}" "$image" "${command[@]:1}" sets --json \
+              > "$reports/$service.out" || status=$?
+            if [ "$status" -ne 0 ]; then
+              outcome="exited $status"
+              [ "$status" -eq 124 ] && outcome="timed out after 10 minutes"
+              echo "::error title=migrate sets::$service: '${command[*]} sets --json' $outcome in $image; the image must answer the be sdk migrate verbs offline, with no settings or database" >&2
+              exit 1
+            fi
+          done
+          arguments=(sets --output bundle --sets "$reports")
+          [ -n "$ARCHIVE" ] && arguments+=(--archive "$ARCHIVE")
+          python3 .pipelines/generator/release.py "${arguments[@]}"
       - name: Publish the release with its notes
         # The body: the commits since the previous release (release.py notes), then GitHub's generated notes — the
         # pull requests merged since it and the compare link. Wheelhouse shows these bodies before a promotion.

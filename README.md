@@ -211,11 +211,34 @@ extensions: [postgres_fdw]            # untrusted extensions only; a set creates
   descriptor, a service listed twice, a `command` that is not 1–32 non-empty strings, and a `timeout` outside
   `10s`–`60m` (written like `90s`, `10m` or `1h`).
 - `extensions` lists PostgreSQL extension names once each: a lowercase letter, then up to 62 of `a-z`, `0-9`, `_`, `-`.
+- An item may name a pinned service: its image is the pinned digest.
+
+Once `ci` has written the bundle, publish records what each item's image hosts (the manifest levels), before it
+publishes the release or uploads the candidate:
+
+1. For each item, in order, it runs the item's release image (`images.<service>`, pulled by digest) offline:
+   `docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --platform <platform>
+   --entrypoint <command[0]> <image> <command[1:]> sets --json`, so `[dotnet, X.dll, migrate]` runs
+   `dotnet X.dll migrate sets --json`. The be sdk answers it without settings or a database.
+2. A non-zero exit, or a run past 10 minutes, fails the release with `::error title=migrate sets::` naming the service,
+   the command and the image. The container's stderr stays in the job log.
+3. `release.py sets --output bundle --sets <folder> [--archive <product>-release.tar.gz]` reads each item's stdout
+   (`<service>.out`): the JSON report, then the `migrate-result` line, which must come last. It refuses output without
+   that line, without a JSON report before it, with a result whose `exit` is not `0`, with no set, or with a set
+   lacking a `name` or an integer `level`; a malformed result line is tolerated. It then rewrites `release.json` and
+   the archive; `compose.json` is untouched.
 
 | `release.json` key | Written when | Value |
 |---|---|---|
 | `migrate` | `migrate` is declared | `[{"service", "command", "timeoutSeconds"}]`, in the descriptor's order |
+| `migrations` | `migrate` is declared (by `release.py sets`) | `true`: every item's image hosts at least one set |
+| `migrationSets` | `migrate` is declared (by `release.py sets`) | `{"<service>": [<set>, …]}` in item order; each set is an object of the image's `sets --json` `sets` array, verbatim (`name`, `schema`, `strategy`, `level`, and `ownerKind`, `contracts`, `requires`, `dependsOn`, `extensions`, `referenceableTables`, `package`, `version`, `release` when present) |
 | `extensions` | `extensions` is declared, even empty | the declared names, in order |
+
+- `migrations` is the fact Wheelhouse's runner reads (`facts()`, release sets); a bundle without `migrate` carries
+  none of these keys.
+- A local `release.py build` writes `migrate` without the sets; run the images and `release.py sets` to complete it.
+- An image for `linux/arm64` needs emulation on the amd64 runner to answer `sets --json`; no product builds one yet.
 
 ## Security checks
 
@@ -235,5 +258,6 @@ extensions: [postgres_fdw]            # untrusted extensions only; a set creates
 python3 generator/release.py pins --repo <product> --commit HEAD   # the pinned images to resolve, as JSON
 python3 generator/release.py plan --repo <product> --commit HEAD
 python3 generator/release.py notes --repo <product> --commit HEAD --previous v0.4.2
+python3 generator/release.py sets --output <bundle> --sets <folder of <service>.out>   # adds migrationSets
 python3 -B -m unittest -v test_release test_ci_plan   # from generator/
 ```

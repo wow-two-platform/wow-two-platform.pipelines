@@ -47,18 +47,23 @@
       "groupName": "npm non-major"
     },
     {
-      "description": "Base images together",
+      "description": "Base images and the images deploy.yml pins together",
       "matchManagers": [
         "dockerfile",
-        "docker-compose"
+        "docker-compose",
+        "custom.regex"
+      ],
+      "matchDatasources": [
+        "docker"
       ],
       "groupName": "container images"
     },
     {
-      "description": "Own packages and the pipelines tag, last so it wins: no wait, any time, one group, tags kept",
+      "description": "Own packages, own images and the pipelines tag, last so it wins: no wait, any time, one group, tags kept",
       "matchPackageNames": [
         "/^WoW2\\.Sdk\\.Beta(\\.|$)/",
         "@wow-two-beta/**",
+        "/^ghcr\\.io/wow-two(-[a-z]+)*/",
         "wow-two-platform/wow-two-platform.pipelines"
       ],
       "groupName": "wow-two",
@@ -80,6 +85,17 @@
         "repository: (?<depName>wow-two-platform/wow-two-platform\\.pipelines)\\s+ref: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
       ],
       "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
+      "description": "An image deploy.yml pins by release tag (latest is refused), bumped like any image",
+      "managerFilePatterns": [
+        "/^engineering/deployment/deploy\\.yml$/"
+      ],
+      "matchStrings": [
+        "\\n\\s+image:[ \\t]*[\"']?(?<depName>[a-z0-9][a-z0-9._/:-]*[a-z0-9]):(?<currentValue>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})[\"']?\\s"
+      ],
+      "datasourceTemplate": "docker"
     }
   ]
 }

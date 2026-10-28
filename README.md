@@ -251,6 +251,10 @@ publishes the release or uploads the candidate:
   hosted Renovate app runs outside Actions; delivery ignores `renovate/**` pushes and verifies their pull requests.
   Updates come weekly and grouped, wait 3 days after release, and keep commits as `chore: updated <dep> …`; the be
   sdk, the fe sdk and this repository's tags skip the wait.
+- **Pinned images:** since `latest` is refused, a regex manager reads each `image: <repository>:<tag>` line of
+  `engineering/deployment/deploy.yml` (block style, one per line) and proposes the next tag from the registry. Own
+  images (`ghcr.io/wow-two…`) join the `wow-two` group without the wait; any other joins `container images`. A bump
+  is a descriptor change, so its merge releases a bundle with the new digest.
 
 ## Running the generator locally
 

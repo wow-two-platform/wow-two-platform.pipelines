@@ -1,6 +1,17 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Private repositories pay for Actions minutes: no branch or pull request until the owner ticks it in the Dependency Dashboard",
-  "extends": ["github>wow-two-platform/wow-two-platform.pipelines//renovate/renovate-product"],
-  "dependencyDashboardApproval": true
+  "description": "Private repositories pay for Actions minutes: no branch or pull request until the owner ticks it in the Dependency Dashboard, except deploy.yml's pinned images",
+  "extends": [
+    "github>wow-two-platform/wow-two-platform.pipelines//renovate/renovate-product"
+  ],
+  "dependencyDashboardApproval": true,
+  "packageRules": [
+    {
+      "description": "Pinned images update without the Dashboard approval",
+      "matchFileNames": [
+        "engineering/deployment/deploy.yml"
+      ],
+      "dependencyDashboardApproval": false
+    }
+  ]
 }

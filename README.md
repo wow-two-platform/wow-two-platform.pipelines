@@ -253,8 +253,9 @@ publishes the release or uploads the candidate:
   sdk, the fe sdk and this repository's tags skip the wait.
 - **Pinned images:** since `latest` is refused, a regex manager reads each `image: <repository>:<tag>` line of
   `engineering/deployment/deploy.yml` (block style, one per line) and proposes the next tag from the registry. Own
-  images (`ghcr.io/wow-two…`) join the `wow-two` group without the wait; any other joins `container images`. A bump
-  is a descriptor change, so its merge releases a bundle with the new digest.
+  images (`ghcr.io/wow-two…`) skip the wait; others wait 3 days. Every pin bump goes into one `pinned images` pull
+  request, which Renovate merges itself once CI passes, private repositories included, with no Dashboard approval. A
+  bump is a descriptor change, so its merge releases a bundle with the new digest.
 
 ## Running the generator locally
 

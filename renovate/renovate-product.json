@@ -72,6 +72,16 @@
         "at any time"
       ],
       "pinDigests": false
+    },
+    {
+      "description": "Images deploy.yml pins, last so it wins: their own pull request, which Renovate merges once CI passes",
+      "matchFileNames": [
+        "engineering/deployment/deploy.yml"
+      ],
+      "groupName": "pinned images",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": false
     }
   ],
   "customManagers": [

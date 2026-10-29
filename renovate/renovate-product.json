@@ -74,14 +74,13 @@
       "pinDigests": false
     },
     {
-      "description": "Images deploy.yml pins, last so it wins: their own pull request, which Renovate merges once CI passes",
+      "description": "Images deploy.yml pins, last so it wins: their own branch, which Renovate fast-forwards main to once the branch push's CI passes; a pull request only when it fails",
       "matchFileNames": [
         "engineering/deployment/deploy.yml"
       ],
       "groupName": "pinned images",
       "automerge": true,
-      "automergeType": "pr",
-      "platformAutomerge": false
+      "automergeType": "branch"
     }
   ],
   "customManagers": [

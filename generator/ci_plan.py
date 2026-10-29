@@ -9,8 +9,14 @@ paths that changed since the last delivered commit decide the work:
 
 The last delivered commit is the head of the newest successful push run of the same workflow on the same branch whose
 gate (or, before v0.9.0, whose publish) succeeded; a superseded run skips its gate, so it never counts. A dispatched
-commit, a missing or unrelated base and any unreadable answer from GitHub verify everything. Only the Python standard
-library is used, so the plan job installs nothing.
+commit, a missing or unrelated base and any unreadable answer from GitHub verify everything.
+
+A push to a Renovate branch (`renovate/…`) verifies and never publishes: Renovate merges a branch it automerges once
+the push's checks pass. When a pull request run of the same workflow exists for the pushed commit, the push leaves the
+verification to it, so one commit is verified once, and skips its gate like a superseded push.
+
+Publish runs only when `publish` is true: code changed, and the run is not a pull request or a Renovate branch push.
+Only the Python standard library is used, so the plan job installs nothing.
 Rules: wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md § CI workflow.
 """
 from __future__ import annotations
@@ -20,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -33,6 +40,11 @@ COMPARE_LIMIT = 300
 RUN_LOOKBACK = 20
 # A job whose success marks its run's commit delivered: the shared gate, or a pre-v0.9.0 publish.
 DELIVERED_JOB = re.compile(r"(?:^|/ )(?:gate|publish / bundle)$")
+# Renovate's branch prefix: a push there verifies and publishes nothing.
+RENOVATE = "renovate/"
+# Renovate opens a branch's pull request seconds after pushing the branch, so a push that finds no pull request run for
+# its commit looks again once after this many seconds before it verifies.
+PULL_WAIT = 30
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()/-]{0,59}")
 SHA = re.compile(r"[a-f0-9]{40}")
 
@@ -233,9 +245,24 @@ def head_of(github, branch):
     return github.get("/git/ref/heads/" + quote(branch, safe=""))["object"]["sha"]
 
 
+def workflow_of(github, run_id):
+    return github.get("/actions/runs/" + str(run_id))["workflow_id"]
+
+
+def pull_request_run(github, workflow, commit):
+    """The newest pull request run of `workflow` for `commit`, as "pull request #<n>" or "run <id>", else None."""
+    listing = github.get("/actions/workflows/" + str(workflow) + "/runs?event=pull_request&per_page=1&head_sha="
+                         + quote(commit, safe=""))
+    runs = listing.get("workflow_runs") or []
+    if not runs:
+        return None
+    pulls = runs[0].get("pull_requests") or []
+    return "pull request #" + str(pulls[0]["number"]) if pulls else "run " + str(runs[0]["id"])
+
+
 def delivered_base(github, run_id, branch, commit):
     """The head of the newest successful push run on `branch` whose gate or publish succeeded, else None."""
-    workflow = github.get("/actions/runs/" + str(run_id))["workflow_id"]
+    workflow = workflow_of(github, run_id)
     listing = github.get("/actions/workflows/" + str(workflow) + "/runs?event=push&status=success&per_page="
                          + str(RUN_LOOKBACK) + "&branch=" + quote(branch, safe=""))
     for run in listing.get("workflow_runs") or []:
@@ -266,12 +293,13 @@ def changed_since(github, base, commit, related_only):
 # ----------------------------------------------------------------------- plan
 
 def plan(github, event, ref, commit, run_id, main="main", supersede=False, dispatched=False, pull_base="",
-         docs=(), backends=(), frontends=(), browser=None, log=print):
-    """What this run verifies: {superseded, changed, reason, backends, frontends, browsers}."""
+         docs=(), backends=(), frontends=(), browser=None, log=print, wait=time.sleep):
+    """What this run verifies: {superseded, deferred, changed, publish, reason, backends, frontends, browsers}."""
     backends, frontends, shards = checks(backends, frontends, browser)
     docs = [*DOCS, *strings(list(docs), "docs")]
-    nothing = {"backends": [], "frontends": [], "browsers": []}
+    nothing = {"deferred": False, "publish": False, "backends": [], "frontends": [], "browsers": []}
     branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+    renovate = event == "push" and branch != main and branch.startswith(RENOVATE)
     if supersede and event == "push" and branch == main:
         try:
             head = head_of(github, main)
@@ -281,6 +309,20 @@ def plan(github, event, ref, commit, run_id, main="main", supersede=False, dispa
             head = commit
         if head != commit:
             return {"superseded": True, "changed": False, "reason": "superseded by " + head[:7], **nothing}
+    if renovate:
+        try:
+            workflow = workflow_of(github, run_id)
+            pull = pull_request_run(github, workflow, commit)
+            if pull is None:
+                wait(PULL_WAIT)
+                pull = pull_request_run(github, workflow, commit)
+        except (HTTPError, URLError, OSError, KeyError, ValueError, TypeError) as error:
+            log("::warning title=ci plan::Could not read the pull request runs of " + commit[:7] + " ("
+                + str(error)[:120] + "); verifying this push")
+            pull = None
+        if pull is not None:
+            return {"superseded": False, "changed": False, "reason": pull + " verifies " + commit[:7] + " of " + branch,
+                    **nothing, "deferred": True}
     changed, reason = None, "verifying everything"
     try:
         if dispatched:
@@ -310,7 +352,9 @@ def plan(github, event, ref, commit, run_id, main="main", supersede=False, dispa
             return {"superseded": False, "changed": False,
                     "reason": "only docs changed (" + str(len(changed)) + " paths): " + reason, **nothing}
         selected = select(backends, frontends, shards, code)
-    return {"superseded": False, "changed": True, "reason": reason,
+    return {"superseded": False, "deferred": False, "changed": True,
+            "publish": event != "pull_request" and not renovate,
+            "reason": reason + ("; a Renovate branch publishes nothing" if renovate else ""),
             "backends": selected[0], "frontends": selected[1], "browsers": selected[2]}
 
 
@@ -318,6 +362,8 @@ def summary(result):
     lines = ["### CI plan", "", "- " + result["reason"]]
     if result["superseded"]:
         lines.append("- Superseded push: nothing verified or published.")
+    elif result["deferred"]:
+        lines.append("- Verified by the pull request's run: nothing verified or published here.")
     elif not result["changed"]:
         lines.append("- Docs only: nothing built, tested or published.")
     else:
@@ -325,6 +371,7 @@ def summary(result):
             names = [entry["name"] + (" " + str(entry["shard"]) + "/" + str(entry["shards"]) if "shard" in entry else "")
                      for entry in result[kind]]
             lines.append("- " + kind + ": " + (", ".join(names) if names else "none"))
+        lines.append("- publish: " + ("after the checks pass" if result["publish"] else "no"))
     return "\n".join(lines) + "\n"
 
 
@@ -354,7 +401,8 @@ def main():
     except Invalid as error:
         print("::error title=ci plan::" + str(error), file=sys.stderr)
         return 1
-    outputs = {"superseded": str(result["superseded"]).lower(), "changed": str(result["changed"]).lower(),
+    outputs = {"superseded": str(result["superseded"]).lower(), "deferred": str(result["deferred"]).lower(),
+               "changed": str(result["changed"]).lower(), "publish": str(result["publish"]).lower(),
                "backends": json.dumps(result["backends"]), "frontends": json.dumps(result["frontends"]),
                "browsers": json.dumps(result["browsers"])}
     if environment.get("GITHUB_OUTPUT"):
@@ -364,7 +412,7 @@ def main():
     if environment.get("GITHUB_STEP_SUMMARY"):
         with open(environment["GITHUB_STEP_SUMMARY"], "a") as stream:
             stream.write(summary(result))
-    print(json.dumps({key: result[key] for key in ("superseded", "changed", "reason")}))
+    print(json.dumps({key: result[key] for key in ("superseded", "deferred", "changed", "publish", "reason")}))
     return 0
 
 

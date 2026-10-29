@@ -2,7 +2,9 @@
 #   current → plan → ci → publish
 # ci's plan job first skips a main push that a newer push already replaced, then reads what changed since the last
 # delivered commit: a docs-only push builds, tests and publishes nothing. Code changes run the selected checks, and
-# publish (publish.yml) versions, builds and releases the changed services once they pass. A pull request runs ci only.
+# publish (publish.yml) versions, builds and releases the changed services once they pass. A pull request runs ci only,
+# and so does a Renovate branch push (renovate/…), which Renovate merges once it passes; a commit a pull request run
+# also verifies is left to that run.
 # A product that deploys itself adds its own deploy-dev job after this one, gated on the `published` output.
 # Inputs: ci.yml and README.md § Shared CI.
 name: delivery
@@ -77,7 +79,8 @@ jobs:
 
   publish:
     needs: ci
-    if: needs.ci.outputs.changed == 'true' && github.event_name != 'pull_request'
+    # ci's plan sets `publish`: code changed, and the run is not a pull request or a Renovate branch push.
+    if: needs.ci.outputs.publish == 'true'
     uses: ./.github/workflows/publish.yml
     permissions:
       contents: write

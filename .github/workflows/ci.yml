@@ -5,7 +5,10 @@
 #   frontend pnpm workspaces: frozen install, then the listed package.json scripts; pnpm cache
 #   browser  one job per shard, with $SHARD and $SHARDS; evidence uploaded on failure
 #   gate     the one result to wait on: it passes when every selected check passed, also on a docs-only change, and is
-#            skipped only for a superseded push, so such a run never marks its commit delivered
+#            skipped only for a superseded push or a Renovate branch push whose commit a pull request run verifies, so
+#            such a run never marks its commit delivered
+# A Renovate branch push (renovate/…) runs the checks and never publishes: Renovate merges a branch it automerges once
+# they pass. The `publish` output tells delivery whether to publish.
 # Inputs are JSON; their keys and defaults: README.md § Shared CI.
 name: ci
 
@@ -59,6 +62,12 @@ on:
       superseded:
         description: "'true' when a newer main push replaced this one"
         value: ${{ jobs.plan.outputs.superseded }}
+      deferred:
+        description: "'true' when a pull request run verifies this Renovate branch push's commit"
+        value: ${{ jobs.plan.outputs.deferred }}
+      publish:
+        description: "'true' when code changed and the run is not a pull request or a Renovate branch push"
+        value: ${{ jobs.plan.outputs.publish }}
 
 permissions:
   contents: read
@@ -72,7 +81,9 @@ jobs:
       actions: read
     outputs:
       superseded: ${{ steps.plan.outputs.superseded }}
+      deferred: ${{ steps.plan.outputs.deferred }}
       changed: ${{ steps.plan.outputs.changed }}
+      publish: ${{ steps.plan.outputs.publish }}
       backends: ${{ steps.plan.outputs.backends }}
       frontends: ${{ steps.plan.outputs.frontends }}
       browsers: ${{ steps.plan.outputs.browsers }}
@@ -294,8 +305,9 @@ jobs:
 
   gate:
     needs: [plan, backend, frontend, browser]
-    # A superseded push skips the gate, so its run never marks the commit delivered.
-    if: always() && needs.plan.outputs.superseded != 'true'
+    # A superseded push, and a Renovate branch push whose commit a pull request run verifies, skip the gate, so such a
+    # run never marks the commit delivered.
+    if: always() && needs.plan.outputs.superseded != 'true' && needs.plan.outputs.deferred != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -28,7 +28,7 @@ name: publish-docker-image
 
 on:
   push:
-    branches: ['**', '!renovate/**']
+    branches: ['**']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -43,13 +43,13 @@ permissions:
 
 concurrency:
   group: delivery-${{ github.repository }}-${{ inputs.commit || github.ref }}
-  # main queues, so each release reads the tag the previous one created; other refs cancel a superseded run.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main') }}
+  # One run per ref at a time, queued, so each release reads the tag the previous one created. No cancel-in-progress:
+  # GitHub refuses queue: max beside one that evaluates true, and starts no job.
   queue: max
 
 jobs:
   delivery:
-    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.12.0
+    uses: wow-two-platform/wow-two-platform.pipelines/.github/workflows/delivery.yml@v0.13.0
     with:
       commit: ${{ inputs.commit }}
       backends: |
@@ -70,7 +70,12 @@ A push runs `current → plan → ci → publish`:
   nothing, and the gate still passes. A dispatched commit, a first run or an unreadable answer verifies everything.
 - **ci:** each check with `paths` runs when one of them changed; one without runs on every code change; a changed path
   no check owns (a workflow, a root file) runs every check.
-- **publish:** after a passing `ci`, on pushes and dispatches, never on a pull request.
+- **publish:** after a passing `ci`, on pushes and dispatches, never on a pull request or a `renovate/**` push.
+- **Renovate branches:** a `renovate/**` push runs the selected checks and publishes nothing, so Renovate can merge a
+  branch it automerges once they pass. When a `pull_request` run of the same workflow exists for the pushed commit
+  (Renovate opened a pull request for the branch), the push run leaves the commit to it: it verifies nothing and skips
+  its gate. Renovate opens a pull request seconds after pushing its branch, so a push that finds no such run looks
+  again once after 30 seconds.
 - A product that deploys itself adds a job after `delivery` with
   `if: needs.delivery.outputs.published == 'true'`; Wheelhouse's `deploy-dev` is the one case.
 
@@ -89,7 +94,10 @@ a list of lines, run with `bash -eo pipefail`.
 - `lfs` is `true` (every LFS file) or `git lfs pull --include` patterns, such as `engineering/codebase/**`; without it
   a check fetches none.
 - Every .NET job restores a NuGet cache keyed on its lockfiles and project files; every Node job a pnpm store cache.
-- The `gate` job (`ci`'s one result) passes when every selected check passed; it is skipped only on a superseded push.
+- The `gate` job (`ci`'s one result) passes when every selected check passed; it is skipped only on a superseded push
+  and on a `renovate/**` push whose commit a pull request run verifies.
+- `ci` outputs `changed`, `superseded`, `deferred` (a pull request run verifies this Renovate push) and `publish`
+  (code changed, and the run is not a pull request or a Renovate branch push); delivery publishes on `publish`.
 - Every job has a timeout; every action is pinned to a commit.
 
 ## Publish
@@ -97,7 +105,7 @@ a list of lines, run with `bash -eo pipefail`.
 | Built from | Version | Image tags | Bundle |
 |---|---|---|---|
 | `main` | `X.Y.Z` | `X.Y.Z`, `latest` | GitHub release `vX.Y.Z` asset `<product>-release.tar.gz` |
-| any other branch | `X.Y.(Z+1)-<branch>.<n>` | `sha-<commit>` | Actions artifact `bundle-<commit>` |
+| any other branch but `renovate/**` | `X.Y.(Z+1)-<branch>.<n>` | `sha-<commit>` | Actions artifact `bundle-<commit>` |
 | a dispatched commit | `X.Y.(Z+1)-g<commit>` | `sha-<commit>` | Actions artifact `bundle-<commit>` |
 
 - `X.Y` is the newest `engineering/planning/version-track/v{X.Y}/` folder; `Z` follows the highest `vX.Y.*` tag.
@@ -156,6 +164,10 @@ a list of lines, run with `bash -eo pipefail`.
 - From `v0.12.0` a descriptor may declare the migrate step (`migrate`), the untrusted PostgreSQL extensions its sets
   need (`extensions`) and services that run another repository's image pinned by its release tag —
   [below](#migrations-pinned-images-and-extensions). An older tag refuses each.
+- From `v0.13.0` a `renovate/**` push runs `ci` and never publishes, and leaves a commit a pull request run verifies
+  to that run ([above](#calling-it-from-a-product)); products trigger on every branch push (`branches: ['**']`), so
+  Renovate's automerged branches get their checks. An older tag publishes a candidate for any branch push, so a
+  product keeps `'!renovate/**'` until its pin reaches `v0.13.0`. Bundles are byte for byte as before.
 
 ## Migrations, pinned images and extensions
 
@@ -248,14 +260,20 @@ publishes the release or uploads the candidate:
 - **Renovate:** each repository's `.github/renovate.json` extends
   `github>wow-two-platform/wow-two-platform.pipelines//renovate/renovate-product` (public) or `…/renovate-private`
   (private: nothing is branched until the owner ticks it in the Dependency Dashboard, so no Actions minutes). Mend's
-  hosted Renovate app runs outside Actions; delivery ignores `renovate/**` pushes and verifies their pull requests.
+  hosted Renovate app runs outside Actions. Delivery verifies a `renovate/**` push without publishing it, and leaves a
+  commit that has a pull request to that pull request's run; such a push still costs its plan job.
   Updates come weekly and grouped, wait 3 days after release, and keep commits as `chore: updated <dep> …`; the be
   sdk, the fe sdk and this repository's tags skip the wait.
 - **Pinned images:** since `latest` is refused, a regex manager reads each `image: <repository>:<tag>` line of
   `engineering/deployment/deploy.yml` (block style, one per line) and proposes the next tag from the registry. Own
-  images (`ghcr.io/wow-two…`) skip the wait; others wait 3 days. Every pin bump goes into one `pinned images` pull
-  request, which Renovate merges itself once CI passes, private repositories included, with no Dashboard approval. A
-  bump is a descriptor change, so its merge releases a bundle with the new digest.
+  images (`ghcr.io/wow-two…`) skip the wait; others wait 3 days. Every pin bump goes into one `pinned images` branch,
+  `renovate/pinned-images`, with no pull request (`automergeType: branch`), private repositories included, with no
+  Dashboard approval. The branch push runs the product's checks; once every status check on the commit passes,
+  Renovate fast-forwards `main` to it (`git merge --ff-only`, then a push), rebasing the branch first when `main` moved.
+  Renovate opens a pull request only when a check fails or stays pending past `prNotPendingHours` (25 hours), and stops
+  automerging that branch while the pull request is open. A bump is a descriptor change, so the `main` push releases a
+  bundle with the new digest. A branch protection rule that requires pull requests on `main` blocks the push, and
+  Renovate then falls back to a pull request.
 
 ## Running the generator locally
 

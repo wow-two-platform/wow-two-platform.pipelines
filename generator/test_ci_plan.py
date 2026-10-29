@@ -31,9 +31,10 @@ BROWSER = {"name": "Browser", "dir": "engineering/codebase/app.frontend-services
 class FakeGitHub:
     """Answers the plan's REST paths from canned data and records what it was asked."""
 
-    def __init__(self, head=HEAD, runs=(), jobs=None, compare=None, failing=()):
+    def __init__(self, head=HEAD, runs=(), jobs=None, compare=None, failing=(), pull_runs=((),)):
         self.head, self.runs, self.jobs, self.compare = head, list(runs), jobs or {}, compare or {}
-        self.failing, self.asked = failing, []
+        # Each listing of pull request runs answers the next entry; the last one repeats.
+        self.failing, self.asked, self.pull_runs = failing, [], [list(answer) for answer in pull_runs]
 
     def get(self, path):
         self.asked.append(path)
@@ -43,7 +44,11 @@ class FakeGitHub:
             return {"object": {"sha": self.head}}
         if re.fullmatch(r"/actions/runs/\d+", path):
             return {"id": int(path.rsplit("/", 1)[1]), "workflow_id": 7}
-        if path.startswith("/actions/workflows/7/runs?"):
+        if path.startswith("/actions/workflows/7/runs?event=pull_request&"):
+            sha = re.search(r"&head_sha=([a-f0-9]{40})$", path).group(1)
+            answer = self.pull_runs.pop(0) if len(self.pull_runs) > 1 else self.pull_runs[0]
+            return {"workflow_runs": [run for run in answer if run["head_sha"] == sha]}
+        if path.startswith("/actions/workflows/7/runs?event=push&"):
             return {"workflow_runs": self.runs}
         match = re.fullmatch(r"/actions/runs/(\d+)/jobs\?per_page=100", path)
         if match:
@@ -62,11 +67,16 @@ def gate(conclusion="success", name="delivery / ci / gate"):
     return [{"name": "delivery / ci / plan", "conclusion": "success"}, {"name": name, "conclusion": conclusion}]
 
 
-def run_plan(github, event="push", ref="refs/heads/main", **options):
+def run_plan(github, event="push", ref="refs/heads/main", waited=None, **options):
     logged = []
     result = ci_plan.plan(github, event, ref, HEAD, 900, log=logged.append,
+                          wait=(waited if waited is not None else []).append,
                           **{"backends": BACKENDS, "frontends": FRONTENDS, "browser": BROWSER, **options})
     return result, logged
+
+
+def pull_run(sha=HEAD, number=12, run_id=41):
+    return {"id": run_id, "head_sha": sha, "pull_requests": [{"number": number}] if number else []}
 
 
 def names(result):
@@ -246,6 +256,74 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(run_plan(github, docs=["engineering/operations/**"])[0]["changed"])
 
 
+class RenovateTests(unittest.TestCase):
+    """A Renovate branch push verifies and never publishes; a commit a pull request run verifies is left to it."""
+
+    def test_a_renovate_branch_without_a_pull_request_verifies_its_change_and_publishes_nothing(self):
+        github = FakeGitHub(runs=[], compare={"main": compared("engineering/deployment/deploy.yml")})
+        waited = []
+        result, _ = run_plan(github, ref="refs/heads/renovate/pinned-images", waited=waited, supersede=True)
+        self.assertEqual((False, False, True, False), (result["superseded"], result["deferred"], result["changed"],
+                                                      result["publish"]))
+        # deploy.yml belongs to no check's paths, so every check runs.
+        self.assertEqual((["Backend", "Runner"], ["Frontend"], [1, 2, 3]), names(result))
+        self.assertEqual("changes since the branch left main; a Renovate branch publishes nothing", result["reason"])
+        # It looks for a pull request run twice, once after the wait for Renovate to open one.
+        self.assertEqual([ci_plan.PULL_WAIT], waited)
+        self.assertEqual(2, sum("event=pull_request" in path for path in github.asked))
+
+    def test_a_renovate_commit_a_pull_request_run_verifies_is_left_to_that_run(self):
+        github = FakeGitHub(pull_runs=[[pull_run()]])
+        waited = []
+        result, _ = run_plan(github, ref="refs/heads/renovate/nuget-non-major", waited=waited)
+        self.assertEqual((True, False, False, ([], [], [])),
+                         (result["deferred"], result["changed"], result["publish"], names(result)))
+        self.assertEqual("pull request #12 verifies " + HEAD[:7] + " of renovate/nuget-non-major", result["reason"])
+        self.assertEqual([], waited)
+        self.assertFalse(any(path.startswith("/compare/") for path in github.asked))
+
+    def test_a_pull_request_opened_while_the_push_waits_still_takes_the_commit(self):
+        github = FakeGitHub(pull_runs=[[], [pull_run(number=None)]])
+        waited = []
+        result, _ = run_plan(github, ref="refs/heads/renovate/npm-non-major", waited=waited)
+        self.assertEqual((True, "run 41 verifies " + HEAD[:7] + " of renovate/npm-non-major"),
+                         (result["deferred"], result["reason"]))
+        self.assertEqual([ci_plan.PULL_WAIT], waited)
+
+    def test_a_pull_request_run_of_an_older_commit_does_not_take_this_one(self):
+        github = FakeGitHub(runs=[], pull_runs=[[pull_run(sha=OLDER)]],
+                            compare={"main": compared("engineering/deployment/deploy.yml")})
+        result, _ = run_plan(github, ref="refs/heads/renovate/pinned-images")
+        self.assertEqual((False, True, False), (result["deferred"], result["changed"], result["publish"]))
+
+    def test_unreadable_pull_request_runs_verify_the_push_with_a_warning(self):
+        github = FakeGitHub(runs=[], failing=("/actions/workflows/7/runs?event=pull_request",),
+                            compare={"main": compared("engineering/deployment/deploy.yml")})
+        result, logged = run_plan(github, ref="refs/heads/renovate/pinned-images")
+        self.assertEqual((False, True, False), (result["deferred"], result["changed"], result["publish"]))
+        self.assertEqual("changes since the branch left main; a Renovate branch publishes nothing", result["reason"])
+        self.assertEqual(1, len(logged))
+        self.assertIn("Could not read the pull request runs", logged[0])
+
+    def test_a_docs_only_renovate_push_verifies_nothing_and_its_gate_still_passes(self):
+        github = FakeGitHub(runs=[], compare={"main": compared("docs/a.md")})
+        result, _ = run_plan(github, ref="refs/heads/renovate/docs")
+        self.assertEqual((False, False, False), (result["deferred"], result["changed"], result["publish"]))
+
+    def test_only_a_code_change_outside_pull_requests_and_renovate_branches_publishes(self):
+        change = compared("engineering/codebase/app.backend-services/A.cs")
+        github = FakeGitHub(runs=[{"id": 5, "head_sha": BASE}], jobs={5: gate()}, compare={BASE: change, "main": change})
+        self.assertTrue(run_plan(github)[0]["publish"])
+        self.assertTrue(run_plan(github, ref="refs/heads/feature")[0]["publish"])
+        self.assertTrue(run_plan(github, event="workflow_dispatch", dispatched=True)[0]["publish"])
+        self.assertFalse(run_plan(github, event="pull_request", ref="refs/pull/3/merge", pull_base=BASE)[0]["publish"])
+        # A branch merely named like Renovate's, as main, is still main.
+        result, _ = run_plan(github, ref="refs/heads/renovate/main", main="renovate/main")
+        self.assertEqual((False, True), (result["deferred"], result["publish"]))
+        # A superseded main push publishes nothing either.
+        self.assertFalse(run_plan(FakeGitHub(head=OTHER), supersede=True)[0]["publish"])
+
+
 class MainTests(unittest.TestCase):
     def test_main_writes_outputs_and_a_summary_and_refuses_bad_json(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -259,10 +337,13 @@ class MainTests(unittest.TestCase):
                     unittest.mock.patch("sys.stdout"), unittest.mock.patch("sys.stderr"):
                 self.assertEqual(0, ci_plan.main())
                 written = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
-                self.assertEqual(("false", "true", "[]"), (written["superseded"], written["changed"], written["frontends"]))
+                self.assertEqual(("false", "false", "true", "true", "[]"),
+                                 (written["superseded"], written["deferred"], written["changed"], written["publish"],
+                                  written["frontends"]))
                 self.assertEqual(["Backend", "Runner"], [entry["name"] for entry in json.loads(written["backends"])])
                 self.assertEqual(3, len(json.loads(written["browsers"])))
                 self.assertIn("browsers: Browser 1/3, Browser 2/3, Browser 3/3", summary.read_text())
+                self.assertIn("publish: after the checks pass", summary.read_text())
                 with unittest.mock.patch.dict(os.environ, {"PLAN_BACKENDS": "[not json"}):
                     self.assertEqual(1, ci_plan.main())
 
@@ -286,24 +367,27 @@ class WorkflowTests(unittest.TestCase):
                     continue
                 self.assertRegex(action, r"@[a-f0-9]{40}$", name + ": " + action)
 
-    def test_the_gate_needs_every_check_and_skips_only_a_superseded_run(self):
+    def test_the_gate_needs_every_check_and_skips_only_a_superseded_or_deferred_run(self):
         workflow, _ = self.load("ci.yml")
         jobs = workflow["jobs"]
         self.assertEqual({"plan", "backend", "frontend", "browser"}, set(jobs["gate"]["needs"]))
         self.assertIn("always()", jobs["gate"]["if"])
         self.assertIn("needs.plan.outputs.superseded != 'true'", jobs["gate"]["if"])
+        self.assertIn("needs.plan.outputs.deferred != 'true'", jobs["gate"]["if"])
         for check in ("backend", "frontend", "browser"):
             self.assertEqual("plan", jobs[check]["needs"])
-        # PyYAML reads the `on` key as YAML 1.1's true.
-        self.assertEqual("${{ jobs.plan.outputs.changed }}", workflow[True]["workflow_call"]["outputs"]["changed"]["value"])
+        # PyYAML reads the `on` key as YAML 1.1's true. Every plan output the callers read reaches the workflow's.
+        outputs = workflow[True]["workflow_call"]["outputs"]
+        for name in ("changed", "superseded", "deferred", "publish"):
+            self.assertEqual("${{ jobs.plan.outputs." + name + " }}", outputs[name]["value"])
+            self.assertEqual("${{ steps.plan.outputs." + name + " }}", jobs["plan"]["outputs"][name])
 
-    def test_delivery_publishes_only_a_verified_code_change_outside_pull_requests(self):
+    def test_delivery_publishes_only_what_the_plan_marks_publishable(self):
         workflow, _ = self.load("delivery.yml")
         publish = workflow["jobs"]["publish"]
         self.assertEqual("ci", publish["needs"])
         self.assertEqual("./.github/workflows/publish.yml", publish["uses"])
-        for part in ("needs.ci.outputs.changed == 'true'", "github.event_name != 'pull_request'"):
-            self.assertIn(part, publish["if"])
+        self.assertEqual("needs.ci.outputs.publish == 'true'", publish["if"])
         self.assertEqual("./.github/workflows/ci.yml", workflow["jobs"]["ci"]["uses"])
         self.assertTrue(workflow["jobs"]["ci"]["with"]["supersede"])
 

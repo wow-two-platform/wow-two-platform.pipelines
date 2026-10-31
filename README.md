@@ -155,7 +155,12 @@ a list of lines, run with `bash -eo pipefail`.
   an optional plain key, checked against its type. Required keys join `settings.required`; the bundle's
   `release.json` carries the rest under `settings.<service>` (`optional`, `secrets`, `allowed`, `types`), which
   Wheelhouse's runner reads and its console checks saved values against. A bundle without typed keys is byte for byte
-  as before; an older tag refuses the key, and a runner older than Wheelhouse v0.5 refuses `types`.
+  as before; an older tag refuses the key, and a runner older than Wheelhouse v0.5 refuses `types`. From `v0.14.0` a
+  secret text key may `generate` its value (`{random: N, encoding}` or `{command: […], timeout}`) and any key may take
+  another key's value with `from` (alone on its key; a key a service declares, or `Sites:<site>:Url`; one hop). The
+  bundle adds `generate` (the spec with its defaults: `random` and `encoding`, or `command` and `timeoutSeconds`) and
+  `links` (key to source) beside `types`, each only when declared, and a linked key joins no required list. An older tag
+  refuses both fields, and the bundle needs a Wheelhouse runner from v0.11.
 - From `v0.11.0` a descriptor may declare the product's identity: `name` and `description` together, an optional
   `homepage` (an http or https address without credentials), and a service's own `name` and `description`. Each text is
   one line without control characters or leading or trailing space: names 1–80 characters, descriptions 1–200. The

@@ -63,7 +63,13 @@ HOMEPAGE = re.compile(r"https?://[^\s@/?#]+(?:[/?#]\S*)?")
 # What a declared setting's value must look like; Wheelhouse checks each value it saves against the same rules.
 SETTING_TYPES = ("text", "number", "boolean", "choice", "url", "cron", "date", "email")
 SETTING_KEY = re.compile(r"[A-Za-z0-9_.-]{1,100}(?::[A-Za-z0-9_.-]{1,100}){0,9}")
-KEY_FIELDS = {"type", "required", "secret", "default", "values", "format"}
+KEY_FIELDS = {"type", "required", "secret", "default", "values", "format", "generate", "from"}
+# A secret key's `generate`: random bytes in one of two encodings, or a command's output; the command runs 10s-10m.
+RANDOM_BYTES = (16, 64)
+RANDOM_ENCODINGS = ("base64url", "hex")
+GENERATE_TIMEOUT, GENERATE_TIMEOUT_LIMIT = 120, 600
+# A derived key a `from` key may name: a declared site's origin per environment.
+SITE_URL_KEY = re.compile(r"Sites:(" + SLUG.pattern + r"):Url")
 DATE_FORMAT = re.compile(r"(yyyy|MM|dd|HH|mm|ss|[-./: T])+")
 DEFAULT_DATE_FORMAT = "yyyy-MM-dd"
 NUMBER = re.compile(r"-?(0|[1-9][0-9]{0,30})(\.[0-9]{1,30})?")
@@ -150,6 +156,8 @@ def validate(descriptor):
         check(not idle, "No service serves site " + ", ".join(idle))
         result["sites"] = roles
     dependency_order(result["services"])
+    link_sources(result["services"], set(roles) if roles is not None
+                 else {site for service in result["services"].values() for site in service["sites"]})
     dotnet = descriptor.get("dotnetEnvironment", False)
     check(type(dotnet) is bool, "dotnetEnvironment must be true or false")
     result["dotnetEnvironment"] = dotnet
@@ -384,7 +392,7 @@ def service_of(name, service, claimed, roles=None):
         check(isinstance(required, list) and all(isinstance(key, str) and key for key in required),
               name + ": settings required must list keys")
         keys = setting_keys(name, settings.get("keys"))
-        required = list(required) + [key for key, entry in keys.items() if entry["required"] and key not in required]
+        required = list(required) + [key for key, entry in keys.items() if entry.get("required") and key not in required]
         settings = {"file": file, "required": required}
         # Only a descriptor that types its keys carries them, so every other descriptor validates as before.
         if keys:
@@ -442,7 +450,8 @@ def service_of(name, service, claimed, roles=None):
 def setting_keys(name, declared):
     """A service's typed setting keys: each `type` (default text), whether it is `required` or a `secret`, a `default`
     for an optional plain key, a choice key's `values` and a date key's `format`. Defaults are checked against their
-    type by the rules Wheelhouse checks saved values with."""
+    type by the rules Wheelhouse checks saved values with. A secret text key may `generate` its value, and a key that
+    stands alone may take another key's value with `from`; the source is checked across services by `link_sources`."""
     if declared is None:
         return {}
     check(isinstance(declared, dict), name + ": settings keys must map keys to their declarations")
@@ -452,11 +461,24 @@ def setting_keys(name, declared):
         check(isinstance(key, str) and SETTING_KEY.fullmatch(key), what + " must be a configuration path such as Section:Key")
         entry = {} if entry is None else entry
         check(isinstance(entry, dict) and set(entry) <= KEY_FIELDS,
-              what + " takes type, required, secret, default, values and format")
+              what + " takes type, required, secret, default, values, format, generate and from")
+        if "from" in entry:
+            check("generate" not in entry, what + ": generate cannot sit beside from")
+            check(set(entry) == {"from"}, what + ": a linked key stands alone; from takes no other field, "
+                  "since the key takes its source's type and secrecy")
+            source = entry["from"]
+            check(isinstance(source, str) and SETTING_KEY.fullmatch(source),
+                  what + ": from must name a configuration path such as Section:Key")
+            keys[key] = {"from": source}
+            continue
         kind = entry.get("type", "text")
         check(kind in SETTING_TYPES, what + ": type must be one of " + ", ".join(SETTING_TYPES))
         required, secret = entry.get("required", False), entry.get("secret", False)
         check(type(required) is bool and type(secret) is bool, what + ": required and secret must be true or false")
+        if "generate" in entry:
+            check("default" not in entry, what + ": generate cannot sit beside default")
+            check(secret, what + ": generate needs a secret key (secret: true)")
+            check(kind == "text", what + ": generate needs a text key")
         values = entry.get("values")
         if kind == "choice":
             check(isinstance(values, list) and 0 < len(values) <= 50
@@ -488,8 +510,56 @@ def setting_keys(name, declared):
             result["values"] = values
         if kind == "date":
             result["format"] = form
+        if "generate" in entry:
+            result["generate"] = generate_of(what, entry["generate"])
         keys[key] = result
     return keys
+
+
+def generate_of(what, spec):
+    """A secret key's `generate`, with its defaults filled in: `{random: N, encoding}` (N bytes, 16-64, `base64url`
+    unless `hex`) or `{command: [argv...], timeoutSeconds}` (the command's standard output; 10s-10m, 2m by default).
+    Exactly one of the two forms, and nothing else."""
+    what += ": generate"
+    check(isinstance(spec, dict) and ("random" in spec) != ("command" in spec),
+          what + " must be exactly one of random (N random bytes) or command (a list of the program and its arguments)")
+    if "random" in spec:
+        check(set(spec) <= {"random", "encoding"}, what + " random takes only random and encoding")
+        count = spec["random"]
+        check(type(count) is int and RANDOM_BYTES[0] <= count <= RANDOM_BYTES[1],
+              what + " random must be a whole number of bytes, 16-64")
+        encoding = spec.get("encoding", RANDOM_ENCODINGS[0])
+        check(encoding in RANDOM_ENCODINGS, what + " encoding must be base64url or hex")
+        return {"random": count, "encoding": encoding}
+    check(set(spec) <= {"command", "timeout"}, what + " command takes only command and timeout")
+    command = spec["command"]
+    check(isinstance(command, list) and command and all(isinstance(part, str) and part for part in command),
+          what + " command must list the program and its arguments, each a non-empty string")
+    timeout = seconds(spec.get("timeout", str(GENERATE_TIMEOUT // 60) + "m"), what + " timeout")
+    check(10 <= timeout <= GENERATE_TIMEOUT_LIMIT, what + " timeout must be 10s-10m")
+    return {"command": list(command), "timeoutSeconds": timeout}
+
+
+def link_sources(services, sites):
+    """Checks every `from` key's source across the descriptor's services: a key some service declares under
+    `settings.keys`, or `Sites:<site>:Url` for a declared site. A source with its own `from` is refused (one hop, so no
+    cycle), and so is an unknown one."""
+    declared = {}
+    for service in services.values():
+        for key, entry in ((service["settings"] or {}).get("keys") or {}).items():
+            declared.setdefault(key, []).append(entry)
+    for name, service in services.items():
+        for key, entry in ((service["settings"] or {}).get("keys") or {}).items():
+            if "from" not in entry:
+                continue
+            what, source = name + ": setting " + key + ": from " + entry["from"], entry["from"]
+            if source in declared:
+                check(not any("from" in other for other in declared[source]),
+                      what + " is itself linked; a source cannot have from (one hop)")
+                continue
+            match = SITE_URL_KEY.fullmatch(source)
+            check(match is not None and match.group(1) in sites,
+                  what + " names no key a service declares under settings.keys, and no Sites:<site>:Url of a declared site")
 
 
 def scalar(value):
@@ -581,12 +651,17 @@ def cron_part(part, bounds, names, allows_last):
 
 def bundle_settings(keys):
     """What a bundle declares about a service's typed keys, as the runner reads it: `optional` defaults, the `secrets`,
-    each choice's `allowed` values and every key's `types` entry (a date with its format). Empty parts are left out."""
-    declared = {"optional": {key: entry["default"] for key, entry in keys.items() if "default" in entry},
-                "secrets": [key for key, entry in keys.items() if entry["secret"]],
-                "allowed": {key: entry["values"] for key, entry in keys.items() if "values" in entry},
+    each choice's `allowed` values and every key's `types` entry (a date with its format), then each key's `generate`
+    spec (defaults filled in) and each linked key's `links` source. A linked key takes its source's type and secrecy, so
+    it appears only under `links`. Empty parts are left out."""
+    plain = {key: entry for key, entry in keys.items() if "from" not in entry}
+    declared = {"optional": {key: entry["default"] for key, entry in plain.items() if "default" in entry},
+                "secrets": [key for key, entry in plain.items() if entry["secret"]],
+                "allowed": {key: entry["values"] for key, entry in plain.items() if "values" in entry},
                 "types": {key: {"type": entry["type"], **({"format": entry["format"]} if "format" in entry else {})}
-                          for key, entry in keys.items()}}
+                          for key, entry in plain.items()},
+                "generate": {key: entry["generate"] for key, entry in plain.items() if "generate" in entry},
+                "links": {key: entry["from"] for key, entry in keys.items() if "from" in entry}}
     return {part: value for part, value in declared.items() if value}
 
 

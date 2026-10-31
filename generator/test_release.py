@@ -186,6 +186,185 @@ class DescriptorTests(unittest.TestCase):
                 with self.assertRaisesRegex(release.Invalid, message):
                     release.validate(declared)
 
+    def test_generate_keys_fill_their_defaults_and_follow_their_own_required(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {
+            "Auth:ClientSecret": {"secret": True, "required": True, "generate": {"random": 32}},
+            "Auth:Salt": {"type": "text", "secret": True, "generate": {"random": 16, "encoding": "hex"}},
+            "Auth:Pepper": {"secret": True, "generate": {"random": 64, "encoding": "base64url"}},
+            "Auth:SigningKey": {"secret": True, "required": True,
+                                "generate": {"command": ["dotnet", "Pilot.Api.dll", "keys", "generate"]}},
+            "Auth:Shortest": {"secret": True, "generate": {"command": ["keygen"], "timeout": "10s"}},
+            "Auth:Longest": {"secret": True, "generate": {"command": ["keygen"], "timeout": "10m"}},
+            "Auth:Seconds": {"secret": True, "generate": {"command": ["keygen", "--bits", "256"], "timeout": "600s"}},
+        }
+        settings = release.validate(declared)["services"]["api"]["settings"]
+        # A generate key follows its own `required`, like any typed key.
+        self.assertEqual(["Database:Connection", "Auth:ClientSecret", "Auth:SigningKey"], settings["required"])
+        keys = settings["keys"]
+        self.assertEqual({"type": "text", "required": True, "secret": True,
+                          "generate": {"random": 32, "encoding": "base64url"}}, keys["Auth:ClientSecret"])
+        self.assertEqual({"random": 16, "encoding": "hex"}, keys["Auth:Salt"]["generate"])
+        self.assertEqual({"random": 64, "encoding": "base64url"}, keys["Auth:Pepper"]["generate"])
+        self.assertEqual({"command": ["dotnet", "Pilot.Api.dll", "keys", "generate"], "timeoutSeconds": 120},
+                         keys["Auth:SigningKey"]["generate"])
+        self.assertEqual(10, keys["Auth:Shortest"]["generate"]["timeoutSeconds"])
+        self.assertEqual(600, keys["Auth:Longest"]["generate"]["timeoutSeconds"])
+        self.assertEqual(600, keys["Auth:Seconds"]["generate"]["timeoutSeconds"])
+
+    def test_generate_rule_breaks_name_the_rule(self):
+        make = {"random": 32}
+        cases = (
+            ({"A:B": {"generate": make}}, "generate needs a secret key"),
+            ({"A:B": {"secret": False, "generate": make}}, "generate needs a secret key"),
+            ({"A:B": {"secret": True, "type": "number", "generate": make}}, "generate needs a text key"),
+            ({"A:B": {"secret": True, "type": "email", "generate": make}}, "generate needs a text key"),
+            ({"A:B": {"secret": True, "default": "x", "generate": make}}, "generate cannot sit beside default"),
+            ({"A:B": {"default": "x", "generate": make}}, "generate cannot sit beside default"),
+            ({"A:B": {"secret": True, "from": "A:C", "generate": make}, "A:C": {}}, "generate cannot sit beside from"),
+            ({"A:B": {"secret": True, "generate": None}}, "generate must be exactly one of random"),
+            ({"A:B": {"secret": True, "generate": "random"}}, "generate must be exactly one of random"),
+            ({"A:B": {"secret": True, "generate": {}}}, "generate must be exactly one of random"),
+            ({"A:B": {"secret": True, "generate": {"length": 32}}}, "generate must be exactly one of random"),
+            ({"A:B": {"secret": True, "generate": {"random": 32, "command": ["x"]}}}, "generate must be exactly one of"),
+            ({"A:B": {"secret": True, "generate": {"random": 32, "timeout": "2m"}}}, "random takes only random and encoding"),
+            ({"A:B": {"secret": True, "generate": {"random": 32, "length": 1}}}, "random takes only random and encoding"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "encoding": "hex"}}},
+             "command takes only command and timeout"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "random": 32}}}, "generate must be exactly one of"),
+            ({"A:B": {"secret": True, "generate": {"random": 15}}}, "random must be a whole number of bytes, 16-64"),
+            ({"A:B": {"secret": True, "generate": {"random": 65}}}, "random must be a whole number of bytes, 16-64"),
+            ({"A:B": {"secret": True, "generate": {"random": True}}}, "random must be a whole number of bytes, 16-64"),
+            ({"A:B": {"secret": True, "generate": {"random": "32"}}}, "random must be a whole number of bytes, 16-64"),
+            ({"A:B": {"secret": True, "generate": {"random": 32.0}}}, "random must be a whole number of bytes, 16-64"),
+            ({"A:B": {"secret": True, "generate": {"random": 32, "encoding": "base64"}}}, "encoding must be base64url or hex"),
+            ({"A:B": {"secret": True, "generate": {"random": 32, "encoding": None}}}, "encoding must be base64url or hex"),
+            ({"A:B": {"secret": True, "generate": {"command": []}}}, "command must list the program and its arguments"),
+            ({"A:B": {"secret": True, "generate": {"command": "keygen"}}}, "command must list the program and its arguments"),
+            ({"A:B": {"secret": True, "generate": {"command": [""]}}}, "each a non-empty string"),
+            ({"A:B": {"secret": True, "generate": {"command": ["keygen", 1]}}}, "each a non-empty string"),
+            ({"A:B": {"secret": True, "generate": {"command": [None]}}}, "each a non-empty string"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "9s"}}}, "timeout must be 10s-10m"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "11m"}}}, "timeout must be 10s-10m"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "601s"}}}, "timeout must be 10s-10m"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "1h"}}}, "timeout must be 10s-10m"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "0s"}}}, "timeout must look like"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "2 m"}}}, "timeout must look like"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": "120"}}}, "timeout must look like"),
+            ({"A:B": {"secret": True, "generate": {"command": ["x"], "timeout": 120}}}, "timeout must look like"),
+        )
+        for keys, message in cases:
+            with self.subTest(keys=keys):
+                declared = copy.deepcopy(DESCRIPTOR)
+                declared["services"]["api"]["settings"]["keys"] = keys
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(declared)
+
+    def test_from_keys_stand_alone_and_never_join_the_required_list(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {
+            "Auth:ClientSecret": {"secret": True, "required": True, "generate": {"random": 32}},
+            "Auth:Issuer": {"from": "Sites:app:Url"},
+            "Auth:Landing": {"from": "Sites:landing:Url"},
+            "Auth:Again": {"from": "Auth:ClientSecret"},
+            "Plain:Optional": {"default": "x"},
+        }
+        declared["services"]["edge"]["settings"] = {"keys": {"Desk:Secret": {"from": "Auth:ClientSecret"},
+                                                             "Desk:Plain": {"from": "Plain:Optional"}}}
+        descriptor = release.validate(declared)
+        api, edge = descriptor["services"]["api"]["settings"], descriptor["services"]["edge"]["settings"]
+        # A linked key joins no required list, whatever its source does.
+        self.assertEqual(["Database:Connection", "Auth:ClientSecret"], api["required"])
+        self.assertEqual([], edge["required"])
+        self.assertEqual({"from": "Sites:app:Url"}, api["keys"]["Auth:Issuer"])
+        self.assertEqual({"from": "Sites:landing:Url"}, api["keys"]["Auth:Landing"])
+        self.assertEqual({"from": "Auth:ClientSecret"}, edge["keys"]["Desk:Secret"])
+        self.assertEqual({"from": "Plain:Optional"}, edge["keys"]["Desk:Plain"])
+
+    def test_from_names_a_top_level_site_in_descriptor_2(self):
+        declared = copy.deepcopy(DESCRIPTOR_2)
+        declared["services"]["worker"]["settings"] = {"keys": {"Auth:Issuer": {"from": "Sites:app:Url"},
+                                                               "Auth:Admin": {"from": "Sites:admin:Url"}}}
+        keys = release.validate(declared)["services"]["worker"]["settings"]["keys"]
+        self.assertEqual({"Auth:Issuer": {"from": "Sites:app:Url"}, "Auth:Admin": {"from": "Sites:admin:Url"}}, keys)
+        declared["services"]["worker"]["settings"]["keys"]["Auth:Ghost"] = {"from": "Sites:web:Url"}
+        with self.assertRaisesRegex(release.Invalid, "worker: setting Auth:Ghost: from Sites:web:Url names no key"):
+            release.validate(declared)
+
+    def test_from_rule_breaks_name_the_rule(self):
+        cases = []
+        # A linked key stands alone: any other field, even a default one, is refused.
+        for field in ({"type": "text"}, {"required": False}, {"secret": True}, {"default": "x"}, {"values": ["a"]},
+                      {"format": "yyyy"}, {"required": True, "secret": True}):
+            cases.append(({"A:B": {"from": "A:C", **field}, "A:C": {}}, None, "a linked key stands alone"))
+        for source in (5, None, "", ["A:C"], True, "A C", "A::C", "A:C ", "A:C\n"):
+            cases.append(({"A:B": {"from": source}, "A:C": {}}, None, "from must name a configuration path"))
+        cases += [
+            # An unknown source: declared nowhere, only in settings.required, or a site/derived key that is not there.
+            ({"A:B": {"from": "Nope:Key"}}, None, "A:B: from Nope:Key names no key a service declares"),
+            ({"A:B": {"from": "Database:Connection"}}, None, "names no key a service declares under settings.keys"),
+            ({"A:B": {"from": "Sites:ghost:Url"}}, None, "names no key a service declares"),
+            ({"A:B": {"from": "Sites:app:Host"}}, None, "names no key a service declares"),
+            ({"A:B": {"from": "sites:app:Url"}}, None, "names no key a service declares"),
+            ({"A:B": {"from": "Sites:App:Url"}}, None, "names no key a service declares"),
+            # One hop: a source that is itself linked, itself included, or in another service.
+            ({"A:B": {"from": "A:C"}, "A:C": {"from": "A:D"}, "A:D": {}}, None, "A:B: from A:C is itself linked"),
+            ({"A:B": {"from": "A:B"}}, None, "A:B: from A:B is itself linked"),
+            ({"A:B": {"from": "A:C"}, "A:C": {"from": "A:B"}}, None, "is itself linked"),
+            ({"A:C": {"from": "A:D"}, "A:D": {}}, {"E:K": {"from": "A:C"}}, "edge: setting E:K: from A:C is itself linked"),
+            ({"A:C": {"from": "Sites:app:Url"}}, {"E:K": {"from": "A:C"}}, "edge: setting E:K: from A:C is itself linked"),
+        ]
+        for keys, edge_keys, message in cases:
+            with self.subTest(keys=keys, edge=edge_keys):
+                declared = copy.deepcopy(DESCRIPTOR)
+                declared["services"]["api"]["settings"]["keys"] = keys
+                if edge_keys:
+                    declared["services"]["edge"]["settings"] = {"keys": edge_keys}
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(declared)
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
+    def test_the_documented_generated_and_linked_keys_parse(self):
+        text = """
+descriptor: 2
+product: pilot
+sites:
+  identity: { primary: true }
+services:
+  identity:
+    image: ghcr.io/wow-two-sdk-beta/wow-two-sdk-beta.identity/identity:0.3.6
+    health: /health
+    sites:
+      identity: { paths: [/] }
+    settings:
+      keys:
+        Identity:Server:Keys:Signing:0:
+          secret: true
+          required: true
+          generate: { command: [dotnet, Identity.Api.dll, keys, generate, --role, signing] }
+        Identity:Server:Clients:0:ClientSecret:
+          secret: true
+          required: true
+          generate: { random: 32 }
+        Identity:Server:Issuer:
+          from: Sites:identity:Url
+  desk:
+    image: ghcr.io/wow-two-platform/desk/desk:1.0.0
+    health: /health
+    settings:
+      keys:
+        Auth:ClientSecret:
+          from: Identity:Server:Clients:0:ClientSecret
+"""
+        services = release.validate(release.parse(text))["services"]
+        identity = services["identity"]["settings"]
+        self.assertEqual(["Identity:Server:Keys:Signing:0", "Identity:Server:Clients:0:ClientSecret"], identity["required"])
+        self.assertEqual({"command": ["dotnet", "Identity.Api.dll", "keys", "generate", "--role", "signing"],
+                          "timeoutSeconds": 120}, identity["keys"]["Identity:Server:Keys:Signing:0"]["generate"])
+        self.assertEqual({"from": "Sites:identity:Url"}, identity["keys"]["Identity:Server:Issuer"])
+        self.assertEqual({"from": "Identity:Server:Clients:0:ClientSecret"},
+                         services["desk"]["settings"]["keys"]["Auth:ClientSecret"])
+
     def test_cron_takes_five_or_six_fields_names_steps_and_macros(self):
         for value in ("0 3 * * *", "*/15 9-17 * * MON-FRI", "0 0 1 JAN,JUL *", "0 30 2 L * ?", "0 0 * * 5#2", "@daily"):
             self.assertTrue(release.is_cron(value), value)
@@ -1039,6 +1218,66 @@ class PlanTests(unittest.TestCase):
         plain = release.validate(copy.deepcopy(DESCRIPTOR))
         _, untyped = release.render(plain, release.plan(plain, self.repo, self.first, None), images)
         self.assertNotIn("settings", untyped)
+
+    def test_a_bundle_carries_generate_specs_and_links_beside_types(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {
+            "Stripe:ApiKey": {"secret": True, "required": True},
+            "Auth:ClientSecret": {"secret": True, "required": True, "generate": {"random": 32}},
+            "Auth:Salt": {"secret": True, "generate": {"random": 16, "encoding": "hex"}},
+            "Auth:SigningKey": {"secret": True, "generate": {"command": ["dotnet", "Pilot.Api.dll", "keys", "generate"],
+                                                             "timeout": "5m"}},
+            "Auth:Issuer": {"from": "Sites:app:Url"},
+        }
+        declared["services"]["edge"]["settings"] = {"keys": {"Desk:ClientSecret": {"from": "Auth:ClientSecret"}}}
+        descriptor = release.validate(declared)
+        planned = release.plan(descriptor, self.repo, self.first, None)
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+        _, manifest = release.render(descriptor, planned, images)
+        settings = manifest["settings"]
+        # `generate` and `links` sit after `types`; a linked key appears under `links` only, and a generated one still
+        # lists under `secrets` and `types` like any secret text key.
+        self.assertEqual(["secrets", "types", "generate", "links"], list(settings["api"]))
+        self.assertEqual(["Stripe:ApiKey", "Auth:ClientSecret", "Auth:Salt", "Auth:SigningKey"], settings["api"]["secrets"])
+        self.assertEqual({"Stripe:ApiKey", "Auth:ClientSecret", "Auth:Salt", "Auth:SigningKey"}, set(settings["api"]["types"]))
+        self.assertEqual({"Auth:ClientSecret": {"random": 32, "encoding": "base64url"},
+                          "Auth:Salt": {"random": 16, "encoding": "hex"},
+                          "Auth:SigningKey": {"command": ["dotnet", "Pilot.Api.dll", "keys", "generate"],
+                                              "timeoutSeconds": 300}}, settings["api"]["generate"])
+        self.assertEqual({"Auth:Issuer": "Sites:app:Url"}, settings["api"]["links"])
+        self.assertEqual({"links": {"Desk:ClientSecret": "Auth:ClientSecret"}}, settings["edge"])
+        # Only a key that is not linked joins the required configuration.
+        self.assertEqual({"api": ["Database:Connection", "Stripe:ApiKey", "Auth:ClientSecret"], "edge": []},
+                         manifest["requiredConfiguration"])
+        # The bundle holds the recipe, never a value.
+        self.assertNotIn("optional", settings["api"])
+
+    def test_a_descriptor_without_generate_or_from_builds_the_same_bundle_byte_for_byte(self):
+        # The digests were taken from the generator before `generate` and `from` existed.
+        planned = {"release": "v1.2.3", "kind": "release", "sourceCommit": "a" * 40,
+                   "services": {name: {"version": "1.2.3", "changedIn": "v1.2.3"} for name in ("api", "edge")}}
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in ("api", "edge")}
+        typed = copy.deepcopy(DESCRIPTOR)
+        typed["services"]["api"]["settings"]["keys"] = {
+            "Billing:Mode": {"type": "choice", "values": ["test", "live"], "default": "test"},
+            "Stripe:ApiKey": {"secret": True, "required": True},
+            "Promo:EndsOn": {"type": "date", "format": "dd.MM.yyyy"},
+            "Notes:Banner": None,
+        }
+        expected = {
+            "plain": ("a8e69c8526bbfe204dca10c7ec059508f2c0696148eea358407138be3ce15969",
+                      "2124a7591228db8895e845e77b8a576c0a3547d9a328148b14613e7d1f723f87"),
+            "typed": ("a8e69c8526bbfe204dca10c7ec059508f2c0696148eea358407138be3ce15969",
+                      "5043ca5f8c561bf8138140474f8afdaa2375f7a98379978bde2b231bde40cfc9"),
+        }
+        for label, declared in (("plain", DESCRIPTOR), ("typed", typed)):
+            with self.subTest(label):
+                compose_bytes, manifest = release.render(release.validate(copy.deepcopy(declared)), planned, images)
+                release_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
+                self.assertEqual(expected[label], (hashlib.sha256(compose_bytes).hexdigest(),
+                                                   hashlib.sha256(release_bytes).hexdigest()))
+                self.assertNotIn(b'"generate"', release_bytes)
+                self.assertNotIn(b'"links"', release_bytes)
 
     def test_a_bundle_carries_the_declared_environment_mapping_and_dev_check(self):
         declared = copy.deepcopy(DESCRIPTOR)

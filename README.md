@@ -311,5 +311,5 @@ python3 generator/release.py pins --repo <product> --commit HEAD   # the pinned 
 python3 generator/release.py plan --repo <product> --commit HEAD
 python3 generator/release.py notes --repo <product> --commit HEAD --previous v0.4.2
 python3 generator/release.py sets --output <bundle> --sets <folder of <service>.out>   # adds migrationSets
-python3 -B -m unittest -v test_release test_ci_plan   # from generator/
+python3 -B -m unittest -v test_release test_ci_plan   # from generator/; the YAML tests skip without PyYAML
 ```

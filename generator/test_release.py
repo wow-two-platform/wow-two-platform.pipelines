@@ -672,7 +672,7 @@ class MigrateTests(unittest.TestCase):
                 release_bytes, compose_bytes = fixed_bundle(release.validate(copy.deepcopy(declared)))
                 self.assertEqual((release_hash, compose_hash), (hashlib.sha256(release_bytes).hexdigest(),
                                                                 hashlib.sha256(compose_bytes).hexdigest()))
-                for key in ("migrate", "migrations", "migrationSets", "extensions"):
+                for key in ("migrate", "migrations", "migrationSets", "configCheck", "extensions"):
                     self.assertNotIn('"' + key + '"', release_bytes.decode())
 
     @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
@@ -695,6 +695,88 @@ extensions: [postgres_fdw]            # untrusted extensions only; a set creates
         self.assertEqual([{"service": "management", "command": ["dotnet", "ForeverPin.Api.dll", "migrate"],
                            "timeoutSeconds": 600}], descriptor["migrate"])
         self.assertEqual(["postgres_fdw"], descriptor["extensions"])
+
+
+CONFIG_CHECK = [{"service": "api", "command": ["dotnet", "Pilot.Api.dll", "config", "check"]},
+                {"service": "edge", "command": ["/app/edge", "config", "check"], "timeout": "90s"}]
+
+
+class ConfigCheckTests(unittest.TestCase):
+    """The config check step's items: checked, and carried only when declared."""
+
+    def declared(self, **keys):
+        descriptor = copy.deepcopy(DESCRIPTOR)
+        descriptor.update(copy.deepcopy(keys))
+        return descriptor
+
+    def test_a_valid_list_builds_in_the_descriptors_order_with_its_timeouts(self):
+        descriptor = release.validate(self.declared(migrate=MIGRATE, configCheck=CONFIG_CHECK))
+        expected = [{"service": "api", "command": ["dotnet", "Pilot.Api.dll", "config", "check"],
+                     "timeoutSeconds": 120},
+                    {"service": "edge", "command": ["/app/edge", "config", "check"], "timeoutSeconds": 90}]
+        self.assertEqual(expected, descriptor["configCheck"])
+        manifest = json.loads(fixed_bundle(descriptor)[0])
+        self.assertEqual(expected, manifest["configCheck"])
+        self.assertEqual(["api", "edge"], [item["service"] for item in manifest["migrate"]])
+        for bound in ("10s", "10m", "600s"):
+            with self.subTest(timeout=bound):
+                items = [{"service": "api", "command": ["app", "config", "check"], "timeout": bound}]
+                self.assertEqual(1, len(release.validate(self.declared(configCheck=items))["configCheck"]))
+
+    def test_the_step_rides_without_migrate(self):
+        manifest = json.loads(fixed_bundle(release.validate(self.declared(configCheck=CONFIG_CHECK[:1])))[0])
+        self.assertEqual(["api"], [item["service"] for item in manifest["configCheck"]])
+        self.assertNotIn("migrate", manifest)
+
+    def test_rule_breaks_name_the_rule(self):
+        api = ["dotnet", "Pilot.Api.dll", "config", "check"]
+        cases = (
+            ([{"service": "api", "command": api, "timeout": "5s"}], "configCheck api timeout must be 10s-10m"),
+            ([{"service": "api", "command": api, "timeout": "11m"}], "configCheck api timeout must be 10s-10m"),
+            ([{"service": "api", "command": api, "timeout": "1h"}], "configCheck api timeout must be 10s-10m"),
+            ([{"service": "api", "command": api, "timeout": 120}], "configCheck api timeout must look like"),
+            ([{"service": "worker", "command": api}], r"configCheck item 1: service must name a service of this "
+                                                      r"descriptor \(worker is not one\)"),
+            ([{"command": api}], "configCheck item 1: service must name a service"),
+            ([{"service": "api", "command": []}], "configCheck api: command must list the program"),
+            ([{"service": "api"}], "configCheck api: command must list the program"),
+            ([{"service": "api", "command": "dotnet Pilot.Api.dll config check"}], "command must list the program"),
+            ([{"service": "api", "command": ["config", "check"]}], "command must list the program"),
+            ([{"service": "api", "command": ["dotnet", "Pilot.Api.dll", "migrate"]}], "ending in config check"),
+            ([{"service": "api", "command": ["dotnet", "Pilot.Api.dll", "check", "config"]}], "ending in config check"),
+            ([{"service": "api", "command": ["dotnet", "", "config", "check"]}], "command must list the program"),
+            ([{"service": "api", "command": ["x"] * 31 + ["config", "check"]}], "command must list the program"),
+            ([{"service": "api", "command": api, "image": "x"}], "configCheck item 1 takes service, command and timeout"),
+            ([{"service": "api", "command": api}, {"service": "api", "command": api}],
+             "configCheck lists api twice; declare one item per service"),
+            (["api"], "configCheck item 1 takes service, command and timeout"),
+            ([], "configCheck must list at least one item"),
+            (None, "configCheck must list at least one item"),
+            ({"service": "api", "command": api}, "configCheck must list at least one item"),
+        )
+        for items, message in cases:
+            with self.subTest(message=message, items=items):
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(self.declared(configCheck=items))
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
+    def test_the_documented_example_parses(self):
+        text = """
+descriptor: 2
+product: foreverpin
+services:
+  management:
+    build: { dockerfile: deployment/Dockerfile }
+    paths: [codebase/**]
+    health: /health
+configCheck:                          # one item per service that has settings
+  - service: management
+    command: [dotnet, ForeverPin.Api.dll, config, check]
+    timeout: 2m                       # default 2m; 10s-10m
+"""
+        descriptor = release.validate(release.parse(text))
+        self.assertEqual([{"service": "management", "command": ["dotnet", "ForeverPin.Api.dll", "config", "check"],
+                           "timeoutSeconds": 120}], descriptor["configCheck"])
 
 
 SETS = [{"name": "pilot", "schema": "public", "strategy": "bespoke", "level": 3,

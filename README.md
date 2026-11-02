@@ -173,6 +173,8 @@ a list of lines, run with `bash -eo pipefail`.
   to that run ([above](#calling-it-from-a-product)); products trigger on every branch push (`branches: ['**']`), so
   Renovate's automerged branches get their checks. An older tag publishes a candidate for any branch push, so a
   product keeps `'!renovate/**'` until its pin reaches `v0.13.0`. Bundles are byte for byte as before.
+- From `v0.15.0` a descriptor may declare the config check step (`configCheck`) —
+  [below](#config-check). An older tag refuses the key, and the bundle needs a Wheelhouse runner from v0.12.
 
 ## Migrations, pinned images and extensions
 
@@ -256,6 +258,28 @@ publishes the release or uploads the candidate:
   none of these keys.
 - A local `release.py build` writes `migrate` without the sets; run the images and `release.py sets` to complete it.
 - An image for `linux/arm64` needs emulation on the amd64 runner to answer `sets --json`; no product builds one yet.
+
+### Config check
+
+Rules: `wow-two-ws/conventions/deployment/descriptor/deploy-descriptor.md` § *Config check*.
+
+```yaml
+configCheck:                          # one item per service that has settings
+  - service: management               # a service of this descriptor
+    command: [dotnet, ForeverPin.Api.dll, config, check]   # the image's entrypoint and arguments, ending in config check
+    timeout: 2m                       # default 2m; 10s-10m
+```
+
+- `configCheck` lists at least one item. The generator refuses an item whose `service` is not a service of this
+  descriptor, a service listed twice, a `command` that is not 3–32 non-empty strings ending in `config` and `check`,
+  and a `timeout` outside `10s`–`10m`.
+- An item may name a pinned service: Wheelhouse runs it from the pinned image.
+- The generator never runs the check: it needs the target's rendered settings, so Wheelhouse's runner runs it on the
+  target after migrate, on settings-only applies and in the rollback gate.
+
+| `release.json` key | Written when | Value |
+|---|---|---|
+| `configCheck` | `configCheck` is declared | `[{"service", "command", "timeoutSeconds"}]`, in the descriptor's order |
 
 ## Security checks
 

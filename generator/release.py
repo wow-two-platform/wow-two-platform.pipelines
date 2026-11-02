@@ -54,7 +54,7 @@ SETTINGS_FILE = "/app/appsettings.Target.json"
 SERVICE_KEYS = {"image", "build", "paths", "port", "health", "memory", "stopGrace", "settings", "volumes", "sites",
                 "needs", "capabilities", "dependsOn", "name", "description"}
 TOP_KEYS = {"descriptor", "product", "platform", "shared", "sites", "services", "dotnetEnvironment", "verify",
-            "name", "description", "homepage", "migrate", "extensions"}
+            "name", "description", "homepage", "migrate", "configCheck", "extensions"}
 # The product's identity: its display name, one line on what it does and its public address, and each service's own
 # name and description. Wheelhouse reads them from the repository at a commit; bundles never carry them.
 NAME_LIMIT, DESCRIPTION_LIMIT, HOMEPAGE_LIMIT = 80, 200, 300
@@ -81,6 +81,10 @@ CRON_DAYS = ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT")
 VERIFY_TIMEOUT, VERIFY_TIMEOUT_LIMIT = 300, 1800
 # The migrate step, one item per image that hosts a migration set: how long an item may run, by default and at most.
 MIGRATE_TIMEOUT, MIGRATE_TIMEOUT_LIMIT = 600, 3600
+# The config check step, one item per service that has settings: how long an item may run, by default and at most,
+# and the be sdk verb its command must end in.
+CONFIG_CHECK_TIMEOUT, CONFIG_CHECK_TIMEOUT_LIMIT = 120, 600
+CONFIG_CHECK_VERB = ["config", "check"]
 # An untrusted PostgreSQL extension Wheelhouse creates as superuser when it places the product's database.
 EXTENSION = re.compile(r"[a-z][a-z0-9_-]{0,62}")
 # The be sdk's migrate verbs end their stdout with this line; `sets --json` prints its JSON report before it.
@@ -165,6 +169,8 @@ def validate(descriptor):
     # Each is carried only when declared, so every other descriptor validates and bundles as before.
     if "migrate" in descriptor:
         result["migrate"] = migrate_of(descriptor["migrate"], result["services"])
+    if "configCheck" in descriptor:
+        result["configCheck"] = config_check_of(descriptor["configCheck"], result["services"])
     if "extensions" in descriptor:
         result["extensions"] = extensions_of(descriptor["extensions"])
     return result
@@ -240,6 +246,36 @@ def migrate_of(items, services):
               "[dotnet, Product.Api.dll, migrate]")
         timeout = seconds(item.get("timeout", str(MIGRATE_TIMEOUT // 60) + "m"), "migrate " + service + " timeout")
         check(10 <= timeout <= MIGRATE_TIMEOUT_LIMIT, "migrate " + service + " timeout must be 10s-60m")
+        result.append({"service": service, "command": list(command), "timeoutSeconds": timeout})
+    return result
+
+
+def config_check_of(items, services):
+    """The config check step: one item per service that has settings, which the runner runs after migrate on every
+    forward deploy, on every settings-only apply and in the rollback gate, before any restart. Each names a service of
+    this descriptor whose image runs `command` (ending in the be sdk's `config check` verb) as its entrypoint with that
+    service's rendered settings, bounded by `timeout`: 2m by default, 10s-10m."""
+    check(isinstance(items, list) and items, "configCheck must list at least one item: service, command and timeout")
+    result, listed = [], set()
+    for number, item in enumerate(items, 1):
+        what = "configCheck item " + str(number)
+        check(isinstance(item, dict) and set(item) <= {"service", "command", "timeout"},
+              what + " takes service, command and timeout")
+        service = item.get("service")
+        check(isinstance(service, str) and service in services,
+              what + ": service must name a service of this descriptor"
+              + (" (" + service + " is not one)" if isinstance(service, str) else ""))
+        check(service not in listed, "configCheck lists " + service + " twice; declare one item per service")
+        listed.add(service)
+        command = item.get("command")
+        check(isinstance(command, list) and len(CONFIG_CHECK_VERB) < len(command) <= 32
+              and all(isinstance(part, str) and part and len(part) <= 1000 and "\0" not in part for part in command)
+              and command[-len(CONFIG_CHECK_VERB):] == CONFIG_CHECK_VERB,
+              "configCheck " + service + ": command must list the program and its arguments, ending in config check, "
+              "such as [dotnet, Product.Api.dll, config, check]")
+        timeout = seconds(item.get("timeout", str(CONFIG_CHECK_TIMEOUT // 60) + "m"),
+                          "configCheck " + service + " timeout")
+        check(10 <= timeout <= CONFIG_CHECK_TIMEOUT_LIMIT, "configCheck " + service + " timeout must be 10s-10m")
         result.append({"service": service, "command": list(command), "timeoutSeconds": timeout})
     return result
 
@@ -964,11 +1000,13 @@ def render(descriptor, planned, images, branch=None, rollback_compatible=False, 
         manifest["dotnetEnvironment"] = True
     if descriptor.get("verify"):
         manifest["verify"] = descriptor["verify"]
-    # The migrate step's items, in the descriptor's order, and the untrusted extensions placement creates; each only
-    # when declared, so every other bundle stays byte for byte the same. `release.py sets` adds what each item's image
-    # hosts (`migrations`, `migrationSets`) once the images exist.
+    # The migrate and config check steps' items, in the descriptor's order, and the untrusted extensions placement
+    # creates; each only when declared, so every other bundle stays byte for byte the same. `release.py sets` adds what
+    # each migrate item's image hosts (`migrations`, `migrationSets`) once the images exist.
     if "migrate" in descriptor:
         manifest["migrate"] = descriptor["migrate"]
+    if "configCheck" in descriptor:
+        manifest["configCheck"] = descriptor["configCheck"]
     if "extensions" in descriptor:
         manifest["extensions"] = descriptor["extensions"]
     if branch:

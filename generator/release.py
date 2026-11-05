@@ -487,7 +487,8 @@ def setting_keys(name, declared):
     """A service's typed setting keys: each `type` (default text), whether it is `required` or a `secret`, a `default`
     for an optional plain key, a choice key's `values` and a date key's `format`. Defaults are checked against their
     type by the rules Wheelhouse checks saved values with. A secret text key may `generate` its value, and a key that
-    stands alone may take another key's value with `from`; the source is checked across services by `link_sources`."""
+    stands alone may take another key's value with `from` (`link_of`); the source is checked across services by
+    `link_sources`."""
     if declared is None:
         return {}
     check(isinstance(declared, dict), name + ": settings keys must map keys to their declarations")
@@ -502,10 +503,7 @@ def setting_keys(name, declared):
             check("generate" not in entry, what + ": generate cannot sit beside from")
             check(set(entry) == {"from"}, what + ": a linked key stands alone; from takes no other field, "
                   "since the key takes its source's type and secrecy")
-            source = entry["from"]
-            check(isinstance(source, str) and SETTING_KEY.fullmatch(source),
-                  what + ": from must name a configuration path such as Section:Key")
-            keys[key] = {"from": source}
+            keys[key] = link_of(what, key, entry["from"])
             continue
         kind = entry.get("type", "text")
         check(kind in SETTING_TYPES, what + ": type must be one of " + ", ".join(SETTING_TYPES))
@@ -576,17 +574,34 @@ def generate_of(what, spec):
     return {"command": list(command), "timeoutSeconds": timeout}
 
 
+def link_of(what, key, source):
+    """A `from` key's entry: a configuration path, or another repository's key or site as `{ repository, key }`, naming
+    the repository as a release set's label does (`ocharo-hq/ocharo-platform` is `platform`). This descriptor cannot see
+    another repository's source; Wheelhouse checks it when it composes the release set."""
+    path_rule = what + ": from must name a configuration path such as Section:Key"
+    if not isinstance(source, dict):
+        check(isinstance(source, str) and SETTING_KEY.fullmatch(source), path_rule)
+        return {"from": source}
+    check(set(source) == {"repository", "key"}, what + ": from names another repository's key as { repository, key }")
+    repository, path = source["repository"], source["key"]
+    check(isinstance(repository, str) and SLUG.fullmatch(repository),
+          what + ": from repository must be its short name in the product, such as platform")
+    check(isinstance(path, str) and SETTING_KEY.fullmatch(path), path_rule)
+    check(path != key, what + ": from must name a key other than its own; one key is one value across the product")
+    return {"from": path, "repository": repository}
+
+
 def link_sources(services, sites):
     """Checks every `from` key's source across the descriptor's services: a key some service declares under
     `settings.keys`, or `Sites:<site>:Url` for a declared site. A source with its own `from` is refused (one hop, so no
-    cycle), and so is an unknown one."""
+    cycle), and so is an unknown one. A source in another repository is left to Wheelhouse (`link_of`)."""
     declared = {}
     for service in services.values():
         for key, entry in ((service["settings"] or {}).get("keys") or {}).items():
             declared.setdefault(key, []).append(entry)
     for name, service in services.items():
         for key, entry in ((service["settings"] or {}).get("keys") or {}).items():
-            if "from" not in entry:
+            if "from" not in entry or "repository" in entry:
                 continue
             what, source = name + ": setting " + key + ": from " + entry["from"], entry["from"]
             if source in declared:
@@ -688,8 +703,9 @@ def cron_part(part, bounds, names, allows_last):
 def bundle_settings(keys):
     """What a bundle declares about a service's typed keys, as the runner reads it: `optional` defaults, the `secrets`,
     each choice's `allowed` values and every key's `types` entry (a date with its format), then each key's `generate`
-    spec (defaults filled in) and each linked key's `links` source. A linked key takes its source's type and secrecy, so
-    it appears only under `links`. Empty parts are left out."""
+    spec (defaults filled in) and each linked key's `links` source, with `linkRepositories` naming the repository of a
+    source in another one. A linked key takes its source's type and secrecy, so it appears only under `links`. Empty
+    parts are left out."""
     plain = {key: entry for key, entry in keys.items() if "from" not in entry}
     declared = {"optional": {key: entry["default"] for key, entry in plain.items() if "default" in entry},
                 "secrets": [key for key, entry in plain.items() if entry["secret"]],
@@ -697,7 +713,8 @@ def bundle_settings(keys):
                 "types": {key: {"type": entry["type"], **({"format": entry["format"]} if "format" in entry else {})}
                           for key, entry in plain.items()},
                 "generate": {key: entry["generate"] for key, entry in plain.items() if "generate" in entry},
-                "links": {key: entry["from"] for key, entry in keys.items() if "from" in entry}}
+                "links": {key: entry["from"] for key, entry in keys.items() if "from" in entry},
+                "linkRepositories": {key: entry["repository"] for key, entry in keys.items() if "repository" in entry}}
     return {part: value for part, value in declared.items() if value}
 
 

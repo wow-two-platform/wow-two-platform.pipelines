@@ -175,6 +175,12 @@ a list of lines, run with `bash -eo pipefail`.
   product keeps `'!renovate/**'` until its pin reaches `v0.13.0`. Bundles are byte for byte as before.
 - From `v0.15.0` a descriptor may declare the config check step (`configCheck`) —
   [below](#config-check). An older tag refuses the key, and the bundle needs a Wheelhouse runner from v0.12.
+- From `v0.16.0` a `from` may name a key or site of another repository of the product:
+  `from: { repository: platform, key: Identity:Server:Clients:3:ClientSecret }`, with the repository's short name as a
+  release set's label gives it. The generator cannot see that source, so Wheelhouse checks it when it composes the set
+  and refuses the deploy when it is missing. The bundle adds `linkRepositories` beside `links`, and a descriptor without
+  this form builds byte for byte as before. An older tag refuses the form, and the bundle needs a Wheelhouse runner
+  that reads `linkRepositories`.
 
 ## Migrations, pinned images and extensions
 

@@ -291,6 +291,49 @@ class DescriptorTests(unittest.TestCase):
         with self.assertRaisesRegex(release.Invalid, "worker: setting Auth:Ghost: from Sites:web:Url names no key"):
             release.validate(declared)
 
+    def test_from_may_name_another_repositorys_key_or_site(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["edge"]["settings"] = {"keys": {
+            "Auth:ClientSecret": {"from": {"repository": "platform", "key": "Identity:Server:Clients:3:ClientSecret"}},
+            "Auth:Authority": {"from": {"repository": "platform", "key": "Sites:identity:Url"}},
+        }}
+        edge = release.validate(declared)["services"]["edge"]["settings"]
+        self.assertEqual({"from": "Identity:Server:Clients:3:ClientSecret", "repository": "platform"},
+                         edge["keys"]["Auth:ClientSecret"])
+        self.assertEqual({"from": "Sites:identity:Url", "repository": "platform"}, edge["keys"]["Auth:Authority"])
+        # A linked key joins no required list, wherever its source lives.
+        self.assertEqual([], edge["required"])
+
+    def test_a_from_into_another_repository_names_the_rule(self):
+        good = {"repository": "platform", "key": "A:C"}
+        cases = [
+            ({"repository": "platform"}, "from names another repository's key as { repository, key }"),
+            ({"key": "A:C"}, "from names another repository's key as { repository, key }"),
+            ({}, "from names another repository's key as { repository, key }"),
+            ({**good, "secret": True}, "from names another repository's key as { repository, key }"),
+            ({**good, "repository": "Platform"}, "from repository must be its short name"),
+            ({**good, "repository": "owner/platform"}, "from repository must be its short name"),
+            ({**good, "repository": 5}, "from repository must be its short name"),
+            ({**good, "key": "A C"}, "from must name a configuration path"),
+            ({**good, "key": None}, "from must name a configuration path"),
+            ({**good, "key": "A:B"}, "from must name a key other than its own"),
+        ]
+        for source, message in cases:
+            with self.subTest(source=source):
+                declared = copy.deepcopy(DESCRIPTOR)
+                declared["services"]["api"]["settings"]["keys"] = {"A:B": {"from": source}}
+                with self.assertRaisesRegex(release.Invalid, message):
+                    release.validate(declared)
+        # A linked key stands alone here too.
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {"A:B": {"from": good, "required": True}}
+        with self.assertRaisesRegex(release.Invalid, "a linked key stands alone"):
+            release.validate(declared)
+        # One hop holds inside the descriptor: a key linked out of this repository is no source for another link.
+        declared["services"]["api"]["settings"]["keys"] = {"A:B": {"from": good}, "A:D": {"from": "A:B"}}
+        with self.assertRaisesRegex(release.Invalid, "A:D: from A:B is itself linked"):
+            release.validate(declared)
+
     def test_from_rule_breaks_name_the_rule(self):
         cases = []
         # A linked key stands alone: any other field, even a default one, is refused.
@@ -364,6 +407,31 @@ services:
         self.assertEqual({"from": "Sites:identity:Url"}, identity["keys"]["Identity:Server:Issuer"])
         self.assertEqual({"from": "Identity:Server:Clients:0:ClientSecret"},
                          services["desk"]["settings"]["keys"]["Auth:ClientSecret"])
+
+    @unittest.skipUnless(HAS_YAML, "PyYAML is not installed for this interpreter")
+    def test_the_documented_link_into_another_repository_parses(self):
+        text = """
+descriptor: 2
+product: pilot
+sites:
+  marketing: { primary: true }
+services:
+  marketing:
+    image: ghcr.io/wow-two-platform/marketing/marketing:1.0.0
+    health: /health
+    sites:
+      marketing: { paths: [/] }
+    settings:
+      keys:
+        Identity:Client:Authority:
+          from: { repository: platform, key: Sites:identity:Url }
+        Identity:Client:ClientSecret:
+          from: { repository: platform, key: Identity:Server:Clients:3:ClientSecret }
+"""
+        keys = release.validate(release.parse(text))["services"]["marketing"]["settings"]["keys"]
+        self.assertEqual({"from": "Sites:identity:Url", "repository": "platform"}, keys["Identity:Client:Authority"])
+        self.assertEqual({"from": "Identity:Server:Clients:3:ClientSecret", "repository": "platform"},
+                         keys["Identity:Client:ClientSecret"])
 
     def test_cron_takes_five_or_six_fields_names_steps_and_macros(self):
         for value in ("0 3 * * *", "*/15 9-17 * * MON-FRI", "0 0 1 JAN,JUL *", "0 30 2 L * ?", "0 0 * * 5#2", "@daily"):
@@ -1333,6 +1401,24 @@ class PlanTests(unittest.TestCase):
                          manifest["requiredConfiguration"])
         # The bundle holds the recipe, never a value.
         self.assertNotIn("optional", settings["api"])
+
+    def test_a_bundle_names_the_repository_of_a_link_into_another(self):
+        declared = copy.deepcopy(DESCRIPTOR)
+        declared["services"]["api"]["settings"]["keys"] = {"Auth:Issuer": {"from": "Sites:app:Url"}}
+        declared["services"]["edge"]["settings"] = {"keys": {
+            "Auth:ClientSecret": {"from": {"repository": "platform", "key": "Identity:Server:Clients:3:ClientSecret"}},
+            "Auth:Issuer": {"from": "Sites:app:Url"},
+        }}
+        descriptor = release.validate(declared)
+        planned = release.plan(descriptor, self.repo, self.first, None)
+        images = {name: "ghcr.io/o/pilot/" + name + DIGEST for name in descriptor["services"]}
+        _, manifest = release.render(descriptor, planned, images)
+        # The path stays under `links`, so a runner reads it like any link; only a link into another repository is named.
+        self.assertEqual({"links": {"Auth:ClientSecret": "Identity:Server:Clients:3:ClientSecret",
+                                    "Auth:Issuer": "Sites:app:Url"},
+                          "linkRepositories": {"Auth:ClientSecret": "platform"}}, manifest["settings"]["edge"])
+        self.assertEqual({"links": {"Auth:Issuer": "Sites:app:Url"}}, manifest["settings"]["api"])
+        self.assertEqual([], manifest["requiredConfiguration"]["edge"])
 
     def test_a_descriptor_without_generate_or_from_builds_the_same_bundle_byte_for_byte(self):
         # The digests were taken from the generator before `generate` and `from` existed.

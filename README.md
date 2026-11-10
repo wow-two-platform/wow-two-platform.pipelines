@@ -86,7 +86,7 @@ a list of lines, run with `bash -eo pipefail`.
 
 | Input | Keys |
 |---|---|
-| `backends` (list) | `name`, `run`; `dir` (`.`), `dotnet` (a `global.json` or an SDK version), `node` (an `.nvmrc`; adds pnpm), `pnpm-lock` (beside the `.nvmrc`), `python`, `pip` (install arguments), `pip-cache` (requirements glob), `lfs`, `history` (full clone), `pipelines` (the generator at this tag in `$PIPELINES_DIR`), `paths`, `timeout` (30) |
+| `backends` (list) | `name`, `run`; `dir` (`.`), `dotnet` (a `global.json` or an SDK version), `node` (an `.nvmrc`; adds pnpm and installs the `pnpm-lock` workspace), `pnpm-lock` (beside the `.nvmrc`), `python`, `pip` (install arguments), `pip-cache` (requirements glob), `lfs`, `history` (full clone), `pipelines` (the generator at this tag in `$PIPELINES_DIR`), `paths`, `timeout` (30) |
 | `frontends` (list) | `name`, `dir`; `scripts` (`lint typecheck test build`), `node` (`<dir>/.nvmrc`), `lfs`, `paths`, `timeout` (20) |
 | `browser` (object) | `name`, `dir`, `run` (gets `$SHARD`, `$SHARDS`); `shards` (1), `setup`, `dotnet`, `node`, `lfs`, `artifact` (kept on failure), `paths`, `timeout` (30) |
 | `docs` (list) | extra globs that never build |
@@ -175,13 +175,14 @@ a list of lines, run with `bash -eo pipefail`.
   product keeps `'!renovate/**'` until its pin reaches `v0.13.0`. Bundles are byte for byte as before.
 - From `v0.15.0` a descriptor may declare the config check step (`configCheck`) —
   [below](#config-check). An older tag refuses the key, and the bundle needs a Wheelhouse runner from v0.12.
-- From commit `e0d2bf3520e13becbd2ea6484f7f15a348c4d178` (after `v0.15.0`, untagged, so a product pins the full SHA) a `from` may name a key or
-  site of another repository of the product:
+- From `v0.16.0` a `from` may name a key or site of another repository of the product:
   `from: { repository: platform, key: Identity:Server:Clients:3:ClientSecret }`, with the repository's short name as a
   release set's label gives it. The generator cannot see that source, so Wheelhouse checks it when it composes the set
   and refuses the deploy when it is missing. The bundle adds `linkRepositories` beside `links`, and a descriptor without
   this form builds byte for byte as before. An older tag refuses the form, and the bundle needs a Wheelhouse runner
-  that reads `linkRepositories`.
+  that reads `linkRepositories`. In the same tag a backend check with `node` installs its `pnpm-lock` workspace
+  (`--frozen-lockfile`) after the Node setup, so the cached pnpm store exists and a lockfile change no longer fails the
+  job's post step; a check that installed only to fill that store can drop its own install.
 
 ## Migrations, pinned images and extensions
 
